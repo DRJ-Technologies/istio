@@ -52,6 +52,7 @@ type Target struct {
 	SSH              []string          `json:"ssh,omitempty" hcl:"ssh,optional"`
 	Platforms        []string          `json:"platforms,omitempty" hcl:"platforms,optional"`
 	Outputs          []string          `json:"output,omitempty" hcl:"output,optional"`
+	Attest           []string          `json:"attest,omitempty" hcl:"attest,optional"`
 	Pull             *bool             `json:"pull,omitempty" hcl:"pull,optional"`
 	NoCache          *bool             `json:"no-cache,omitempty" hcl:"no-cache,optional"`
 }
@@ -59,6 +60,8 @@ type Target struct {
 type Args struct {
 	Push                bool
 	Save                bool
+	OCIOutputDir        string
+	OCIBuilder          string
 	Builder             string
 	SupportsEmulation   bool
 	NoClobber           bool
@@ -92,6 +95,8 @@ func (a Args) String() string {
 	var b strings.Builder
 	b.WriteString("Push:              " + fmt.Sprint(a.Push) + "\n")
 	b.WriteString("Save:              " + fmt.Sprint(a.Save) + "\n")
+	b.WriteString("OCIOutputDir:      " + a.OCIOutputDir + "\n")
+	b.WriteString("OCIBuilder:        " + a.OCIBuilder + "\n")
 	b.WriteString("NoClobber:         " + fmt.Sprint(a.NoClobber) + "\n")
 	b.WriteString("NoCache:           " + fmt.Sprint(a.NoCache) + "\n")
 	b.WriteString("Targets:           " + fmt.Sprint(a.Targets) + "\n")

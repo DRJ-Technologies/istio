@@ -17,6 +17,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/csv"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -51,7 +52,7 @@ import (
 // Once we have these staged folders, we just construct a docker bakefile and pass it to `buildx
 // bake` and let it do its work.
 func RunDocker(args Args) error {
-	requiresSplitBuild := len(args.Architectures) > 1 && (args.Save || !args.Push)
+	requiresSplitBuild := args.OCIOutputDir == "" && len(args.Architectures) > 1 && (args.Save || !args.Push)
 	if !requiresSplitBuild {
 		log.Infof("building for architectures: %v", args.Architectures)
 		return runDocker(args)
@@ -145,6 +146,12 @@ func RunSave(a Args, files map[string]string) error {
 
 func RunBake(args Args) error {
 	out := filepath.Join(testenv.LocalOut, "dockerx_build", "docker-bake.json")
+	if args.OCIOutputDir != "" {
+		// OCI is a native local exporter. Never create/use the legacy CI builder
+		// or load images into the selected Docker daemon for this mode.
+		return VerboseCommand("docker", "buildx", "bake", "--builder="+args.OCIBuilder,
+			"--allow=fs.write="+args.OCIOutputDir, "-f", out, "all").Run()
+	}
 	_ = os.MkdirAll(filepath.Join(testenv.LocalOut, "release", "docker"), 0o755)
 	if err := createBuildxBuilderIfNeeded(args); err != nil {
 		return err
@@ -242,7 +249,13 @@ func ConstructBakeFile(a Args) (map[string]string, error) {
 			allDestinations.InsertAll(t.Tags...)
 
 			// See https://docs.docker.com/engine/reference/commandline/buildx_build/#output
-			if a.Push {
+			if a.OCIOutputDir != "" {
+				// One name/variant per target keeps index.json a singleton envelope.
+				// Retain provenance using the native legacy attestation format that
+				// Skopeo 1.13.3 can preserve, including its config and layer blobs.
+				t.Outputs = []string{ociOutput(filepath.Join(a.OCIOutputDir, target))}
+				t.Attest = []string{"type=provenance,mode=min"}
+			} else if a.Push {
 				t.Outputs = []string{"type=registry"}
 			} else if a.Save {
 				n := target
@@ -308,6 +321,14 @@ func ConstructBakeFile(a Args) (map[string]string, error) {
 	}
 
 	return tarFiles, os.WriteFile(out, j, 0o644)
+}
+
+func ociOutput(destination string) string {
+	var b strings.Builder
+	w := csv.NewWriter(&b)
+	_ = w.Write([]string{"type=oci", "tar=false", "oci-artifact=false", "dest=" + destination})
+	w.Flush()
+	return strings.TrimSuffix(b.String(), "\n")
 }
 
 func Copy(srcFile, dstFile string) error {

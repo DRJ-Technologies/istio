@@ -51,6 +51,8 @@ func main() {
 	rootCmd.Flags().StringSliceVar(&globalArgs.Architectures, "architectures", globalArgs.Architectures, "architectures to build")
 	rootCmd.Flags().BoolVar(&globalArgs.Push, "push", globalArgs.Push, "push targets to registry")
 	rootCmd.Flags().BoolVar(&globalArgs.Save, "save", globalArgs.Save, "save targets to tar.gz")
+	rootCmd.Flags().StringVar(&globalArgs.OCIOutputDir, "oci-output-dir", "", "export one multiarch OCI layout directory per target under this absolute directory")
+	rootCmd.Flags().StringVar(&globalArgs.OCIBuilder, "oci-builder", "", "explicit buildx builder for OCI export; never creates or selects a shared builder")
 	rootCmd.Flags().BoolVar(&globalArgs.NoCache, "no-cache", globalArgs.NoCache, "disable caching")
 	rootCmd.Flags().BoolVar(&globalArgs.NoClobber, "no-clobber", globalArgs.NoClobber, "do not allow pushing images that already exist")
 	rootCmd.Flags().StringVar(&globalArgs.Builder, "builder", globalArgs.Builder, "type of builder to use. options are crane or docker")
@@ -116,6 +118,20 @@ func ValidateArgs(a Args) error {
 	if a.Push && a.Save {
 		// TODO(https://github.com/moby/buildkit/issues/1555) support both
 		return fmt.Errorf("--push and --save are mutually exclusive")
+	}
+	if a.OCIOutputDir != "" {
+		if a.Push || a.Save || a.NoClobber || a.Builder != DockerBuilder {
+			return fmt.Errorf("OCI export requires the docker builder without --push, --save or --no-clobber")
+		}
+		if !filepath.IsAbs(a.OCIOutputDir) || a.OCIBuilder == "" {
+			return fmt.Errorf("OCI export requires an absolute --oci-output-dir and explicit --oci-builder")
+		}
+		if len(a.Hubs) != 1 || a.Hubs[0] == "" || len(a.Tags) != 1 || a.Tags[0] == "" ||
+			len(a.Variants) != 1 || len(a.Architectures) == 0 {
+			return fmt.Errorf("OCI export requires one hub, tag and variant, and at least one architecture")
+		}
+	} else if a.OCIBuilder != "" {
+		return fmt.Errorf("--oci-builder requires --oci-output-dir")
 	}
 	_, inCI := os.LookupEnv("CI")
 	if a.Push && len(privilegedHubs.Intersection(sets.New(a.Hubs...))) > 0 && !inCI {
