@@ -44,6 +44,7 @@ func TestCompanionBuild(t *testing.T) {
 		{name: "unsupported-architecture", arch: "ppc64le", fails: true},
 		{name: "unset-architecture", arch: "unset", fails: true},
 		{name: "wrong-os-target", target: "x86_64-pc-windows-gnu", fails: true},
+		{name: "invalid-target-arguments", target: "x86_64-unknown-linux-gnu --target=aarch64-unknown-linux-gnu", fails: true},
 		{name: "source-default-profile"},
 		{name: "source-with-stock-cache", profile: "release", cached: true},
 		{name: "failed-compile", mode: "fail", fails: true},
@@ -150,7 +151,7 @@ fi
 			}
 			cargo, cargoErr := os.ReadFile(filepath.Join(root, "cargo"))
 			if strings.HasPrefix(tc.name, "mismatched-") || tc.name == "unsupported-architecture" ||
-				tc.name == "unset-architecture" || tc.name == "wrong-os-target" {
+				tc.name == "unset-architecture" || tc.name == "wrong-os-target" || tc.name == "invalid-target-arguments" {
 				if !os.IsNotExist(cargoErr) {
 					t.Fatalf("invalid architecture reached cargo: %q (%v)", cargo, cargoErr)
 				}
