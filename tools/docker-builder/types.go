@@ -57,23 +57,25 @@ type Target struct {
 }
 
 type Args struct {
-	Push              bool
-	Save              bool
-	Builder           string
-	SupportsEmulation bool
-	NoClobber         bool
-	NoCache           bool
-	Targets           []string
-	Variants          []string
-	Architectures     []string
-	BaseVersion       string
-	BaseImageRegistry string
-	ProxyVersion      string
-	AgentgatewayImage string
-	ZtunnelVersion    string
-	IstioVersion      string
-	Tags              []string
-	Hubs              []string
+	Push                bool
+	Save                bool
+	Builder             string
+	SupportsEmulation   bool
+	NoClobber           bool
+	NoCache             bool
+	Targets             []string
+	Variants            []string
+	Architectures       []string
+	BaseVersion         string
+	BaseImageRegistry   string
+	IptablesBaseImage   string
+	DistrolessBaseImage string
+	ProxyVersion        string
+	AgentgatewayImage   string
+	ZtunnelVersion      string
+	IstioVersion        string
+	Tags                []string
+	Hubs                []string
 	// Suffix on artifacts, used for multi-arch images where we cannot use manifests
 	suffix string
 
@@ -97,6 +99,8 @@ func (a Args) String() string {
 	b.WriteString("Architectures:     " + fmt.Sprint(a.Architectures) + "\n")
 	b.WriteString("BaseVersion:       " + fmt.Sprint(a.BaseVersion) + "\n")
 	b.WriteString("BaseImageRegistry: " + fmt.Sprint(a.BaseImageRegistry) + "\n")
+	b.WriteString("IptablesBaseImage: " + a.IptablesBaseImage + "\n")
+	b.WriteString("DistrolessBaseImage: " + a.DistrolessBaseImage + "\n")
 	b.WriteString("ProxyVersion:      " + fmt.Sprint(a.ProxyVersion) + "\n")
 	b.WriteString("ZtunnelVersion:    " + fmt.Sprint(a.ZtunnelVersion) + "\n")
 	b.WriteString("AgentgatewayImage: " + fmt.Sprint(a.AgentgatewayImage) + "\n")
@@ -249,22 +253,24 @@ func DefaultArgs() Args {
 	}
 
 	return Args{
-		Push:              false,
-		Save:              false,
-		NoCache:           false,
-		Hubs:              hub,
-		Tags:              tag,
-		BaseVersion:       fetchBaseVersion(),
-		BaseImageRegistry: fetchIstioBaseReg(),
-		IstioVersion:      fetchIstioVersion(),
-		ProxyVersion:      pv,
-		AgentgatewayImage: agwImage,
-		ZtunnelVersion:    zv,
-		Architectures:     arch,
-		Targets:           targets,
-		Variants:          variants,
-		Builder:           builder,
-		SupportsEmulation: qemu,
+		Push:                false,
+		Save:                false,
+		NoCache:             false,
+		Hubs:                hub,
+		Tags:                tag,
+		BaseVersion:         fetchBaseVersion(),
+		BaseImageRegistry:   fetchIstioBaseReg(),
+		IptablesBaseImage:   fetchBaseImage("ISTIO_IPTABLES_BASE_IMAGE"),
+		DistrolessBaseImage: fetchBaseImage("ISTIO_DISTROLESS_BASE_IMAGE"),
+		IstioVersion:        fetchIstioVersion(),
+		ProxyVersion:        pv,
+		AgentgatewayImage:   agwImage,
+		ZtunnelVersion:      zv,
+		Architectures:       arch,
+		Targets:             targets,
+		Variants:            variants,
+		Builder:             builder,
+		SupportsEmulation:   qemu,
 	}
 }
 
@@ -274,6 +280,22 @@ var (
 )
 
 var baseVersionRegexp = regexp.MustCompile(`BASE_VERSION \?= (.*)`)
+
+func fetchBaseImage(name string) string {
+	if value, found := os.LookupEnv(name); found {
+		return value
+	}
+	b, err := os.ReadFile(filepath.Join(testenv.IstioSrc, "Makefile.core.mk"))
+	if err != nil {
+		log.Fatalf("failed to read file: %v", err)
+		return ""
+	}
+	match := regexp.MustCompile(`(?m)^` + regexp.QuoteMeta(name) + ` \?= (.*)$`).FindSubmatch(b)
+	if len(match) < 2 {
+		return ""
+	}
+	return string(match[1])
+}
 
 func fetchBaseVersion() string {
 	if b, f := os.LookupEnv("BASE_VERSION"); f {

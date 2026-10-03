@@ -106,11 +106,15 @@ function maybe_build_ztunnel() {
       BUILD_ZTUNNEL_REPO="${ZTUNNEL_DIR}"
     else
       echo "No directory at ${ZTUNNEL_DIR}"
-      return
+      return 1
     fi
   fi
   if [[ "${BUILD_ZTUNNEL_REPO:-}" == "" ]]; then
     return
+  fi
+  if [[ ! -d "${BUILD_ZTUNNEL_REPO}" ]]; then
+    echo "No directory at ${BUILD_ZTUNNEL_REPO}"
+    return 1
   fi
 
   if ! which cargo; then
@@ -146,6 +150,9 @@ ISTIO_ZTUNNEL_LINUX_RELEASE_DIR="${ISTIO_ZTUNNEL_LINUX_RELEASE_DIR:-${TARGET_OUT
 ISTIO_ZTUNNEL_LINUX_DEBUG_DIR="${ISTIO_ZTUNNEL_LINUX_DEBUG_DIR:-${TARGET_OUT_LINUX}/debug}"
 ISTIO_ZTUNNEL_LINUX_RELEASE_PATH="${ISTIO_ZTUNNEL_LINUX_RELEASE_PATH:-${ISTIO_ZTUNNEL_LINUX_RELEASE_DIR}/${ISTIO_ZTUNNEL_LINUX_RELEASE_NAME}}"
 
+if [[ "${BUILD_ZTUNNEL_REPO:-}" != "" || "${BUILD_ZTUNNEL:-}" != "" ]]; then
+  maybe_build_ztunnel
+  exit 0
+fi
 set_download_command
-maybe_build_ztunnel
 download_ztunnel_if_necessary "${ISTIO_ZTUNNEL_RELEASE_URL}" "$ISTIO_ZTUNNEL_LINUX_RELEASE_PATH" "ztunnel"

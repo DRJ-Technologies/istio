@@ -59,6 +59,14 @@ func createArgs(args Args, target string, variant string, architecture string) m
 		"VM_IMAGE_NAME":      vmImageName(target),
 		"VM_IMAGE_VERSION":   vmImageVersion(target),
 	}
+	m["ISTIO_IPTABLES_BASE_IMAGE"] = args.IptablesBaseImage
+	if m["ISTIO_IPTABLES_BASE_IMAGE"] == "" {
+		m["ISTIO_IPTABLES_BASE_IMAGE"] = fmt.Sprintf("%s/iptables:%s", args.BaseImageRegistry, args.BaseVersion)
+	}
+	m["ISTIO_DISTROLESS_BASE_IMAGE"] = args.DistrolessBaseImage
+	if m["ISTIO_DISTROLESS_BASE_IMAGE"] == "" {
+		m["ISTIO_DISTROLESS_BASE_IMAGE"] = fmt.Sprintf("%s/distroless:%s", args.BaseImageRegistry, args.BaseVersion)
+	}
 	// Only needed for crane - buildx does it automagically
 	if architecture != "" {
 		os, arch, _ := strings.Cut(architecture, "/")
