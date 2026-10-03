@@ -1,0 +1,195 @@
+// Copyright Istio Authors
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package main
+
+import (
+	"context"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strings"
+	"testing"
+
+	testenv "istio.io/istio/pkg/test/env"
+)
+
+func TestCompanionBuild(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		mode    string
+		profile string
+		target  string
+		arch    string
+		cached  bool
+		fails   bool
+	}{
+		{name: "source-release", profile: "release"},
+		{name: "source-arm64", profile: "release", target: "aarch64-unknown-linux-gnu", arch: "arm64"},
+		{name: "source-default-arm64", profile: "release", arch: "arm64"},
+		{name: "source-explicit-musl", target: "x86_64-unknown-linux-musl"},
+		{name: "mismatched-amd64", target: "aarch64-unknown-linux-gnu", fails: true},
+		{name: "mismatched-arm64", arch: "arm64", target: "x86_64-unknown-linux-gnu", fails: true},
+		{name: "unsupported-architecture", arch: "ppc64le", fails: true},
+		{name: "unset-architecture", arch: "unset", fails: true},
+		{name: "wrong-os-target", target: "x86_64-pc-windows-gnu", fails: true},
+		{name: "invalid-target-arguments", target: "x86_64-unknown-linux-gnu --target=aarch64-unknown-linux-gnu", fails: true},
+		{name: "source-default-profile"},
+		{name: "source-with-stock-cache", profile: "release", cached: true},
+		{name: "failed-compile", mode: "fail", fails: true},
+		{name: "missing-compile-output", mode: "missing-output", fails: true},
+		{name: "missing-explicit-repo", mode: "missing-repo", fails: true},
+		{name: "missing-inferred-repo", mode: "infer", fails: true},
+		{name: "stock-download", mode: "stock"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			root := t.TempDir()
+			repo, out, commands := filepath.Join(root, "companion"), filepath.Join(root, "linux"), filepath.Join(root, "commands")
+			for _, dir := range []string{repo, out, commands} {
+				if err := os.MkdirAll(dir, 0o700); err != nil {
+					t.Fatal(err)
+				}
+			}
+			write := func(path, text string, mode os.FileMode) {
+				t.Helper()
+				if err := os.WriteFile(path, []byte(text), mode); err != nil {
+					t.Fatal(err)
+				}
+			}
+			write(filepath.Join(root, "istio.deps"), "", 0o600)
+			write(filepath.Join(commands, "cargo"), `#!/bin/bash
+set -eu
+printf '%s\n' "$*" > "$FIXTURE_CARGO_MARKER"
+[[ "${FIXTURE_MODE}" != fail ]] || exit 9
+[[ "${FIXTURE_MODE}" != missing-output ]] || exit 0
+profile=dev
+target=
+for arg in "$@"; do
+  case "$arg" in
+    --profile=*) profile="${arg#--profile=}" ;;
+    --target=*) target="${arg#--target=}" ;;
+  esac
+done
+[[ "$profile" != dev ]] || profile=debug
+path="out/rust/${target:+${target}/}${profile}"
+mkdir -p "$path"
+printf 'paired-companion' > "$path/ztunnel"
+`, 0o700)
+			write(filepath.Join(commands, "curl"), `#!/bin/bash
+set -eu
+if [[ "${1:-}" == --version ]]; then
+  printf 'Protocols: https\n'
+else
+  printf 'download-called' > "$FIXTURE_DOWNLOAD_MARKER"
+  printf 'stock-companion'
+fi
+`, 0o700)
+			if tc.cached {
+				if err := os.MkdirAll(filepath.Join(out, "release"), 0o700); err != nil {
+					t.Fatal(err)
+				}
+				write(filepath.Join(out, "release", "ztunnel-fixture"), "cached-stock", 0o600)
+			}
+			cmd := exec.Command("bash", filepath.Join(testenv.IstioSrc, "bin", "build_ztunnel.sh"))
+			cmd.Dir = root
+			arch := tc.arch
+			if arch == "" {
+				arch = "amd64"
+			}
+			cmd.Env = []string{"PATH=" + commands + ":/usr/bin:/bin", "TARGET_OUT_LINUX=" + out,
+				"ZTUNNEL_REPO_SHA=fixture", "FIXTURE_MODE=" + tc.mode, "FIXTURE_DOWNLOAD_MARKER=" + filepath.Join(root, "download"),
+				"FIXTURE_CARGO_MARKER=" + filepath.Join(root, "cargo")}
+			if arch != "unset" {
+				cmd.Env = append(cmd.Env, "TARGET_ARCH="+arch)
+			}
+			if tc.mode == "infer" {
+				cmd.Env = append(cmd.Env, "BUILD_ZTUNNEL=1")
+			} else if tc.mode != "stock" {
+				if tc.mode == "missing-repo" {
+					repo = filepath.Join(root, "absent")
+				}
+				cmd.Env = append(cmd.Env, "BUILD_ZTUNNEL_REPO="+repo, "BUILD_ZTUNNEL_PROFILE="+tc.profile)
+				if tc.target != "" {
+					cmd.Env = append(cmd.Env, "BUILD_ZTUNNEL_TARGET="+tc.target)
+				}
+			}
+			log, err := cmd.CombinedOutput()
+			if (err != nil) != tc.fails {
+				t.Fatalf("unexpected result: %v\n%s", err, log)
+			}
+			binary, readErr := os.ReadFile(filepath.Join(out, "ztunnel"))
+			if tc.fails {
+				if !os.IsNotExist(readErr) {
+					t.Fatalf("failed source build produced a fallback: %q (%v)", binary, readErr)
+				}
+			} else {
+				want := "paired-companion"
+				if tc.mode == "stock" {
+					want = "stock-companion"
+				}
+				if readErr != nil || string(binary) != want {
+					t.Fatalf("binary = %q (%v), want %q\n%s", binary, readErr, want, log)
+				}
+			}
+			_, downloadErr := os.Stat(filepath.Join(root, "download"))
+			if tc.mode != "stock" && !os.IsNotExist(downloadErr) {
+				t.Fatal("explicit source build reached downloader")
+			}
+			if strings.Contains(string(log), "Downloading ztunnel:") && tc.mode != "stock" {
+				t.Fatal("source build attempted stock download")
+			}
+			cargo, cargoErr := os.ReadFile(filepath.Join(root, "cargo"))
+			if strings.HasPrefix(tc.name, "mismatched-") || tc.name == "unsupported-architecture" ||
+				tc.name == "unset-architecture" || tc.name == "wrong-os-target" || tc.name == "invalid-target-arguments" {
+				if !os.IsNotExist(cargoErr) {
+					t.Fatalf("invalid architecture reached cargo: %q (%v)", cargo, cargoErr)
+				}
+			} else if !tc.fails && tc.mode != "stock" {
+				target := tc.target
+				if target == "" {
+					target = "x86_64-unknown-linux-gnu"
+					if arch == "arm64" {
+						target = "aarch64-unknown-linux-gnu"
+					}
+				}
+				if cargoErr != nil || !strings.Contains(string(cargo), "--target="+target) {
+					t.Fatalf("wrong Rust target: %q (%v), want %s", cargo, cargoErr, target)
+				}
+			}
+		})
+	}
+}
+
+func TestRunMakeArchitecture(t *testing.T) {
+	root := t.TempDir()
+	makePath := filepath.Join(root, "make")
+	if err := os.WriteFile(makePath, []byte("#!/bin/bash\nset -eu\nprintf '%s\\n' \"$TARGET_ARCH\" \"$TARGET_OUT_LINUX\" > \"$FIXTURE_MAKE_MARKER\"\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", root+":/usr/bin:/bin")
+	for _, arch := range []string{"amd64", "arm64"} {
+		t.Run(arch, func(t *testing.T) {
+			marker := filepath.Join(root, arch)
+			t.Setenv("FIXTURE_MAKE_MARKER", marker)
+			if err := RunMake(context.Background(), Args{}, "linux/"+arch, "init"); err != nil {
+				t.Fatal(err)
+			}
+			b, err := os.ReadFile(marker)
+			want := arch + "\n" + filepath.Join(testenv.IstioSrc, "out", "linux_"+arch) + "\n"
+			if err != nil || string(b) != want {
+				t.Fatalf("make architecture/output = %q (%v), want %q", b, err, want)
+			}
+		})
+	}
+}

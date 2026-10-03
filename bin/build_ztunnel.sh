@@ -106,12 +106,31 @@ function maybe_build_ztunnel() {
       BUILD_ZTUNNEL_REPO="${ZTUNNEL_DIR}"
     else
       echo "No directory at ${ZTUNNEL_DIR}"
-      return
+      return 1
     fi
   fi
   if [[ "${BUILD_ZTUNNEL_REPO:-}" == "" ]]; then
     return
   fi
+  if [[ ! -d "${BUILD_ZTUNNEL_REPO}" ]]; then
+    echo "No directory at ${BUILD_ZTUNNEL_REPO}"
+    return 1
+  fi
+
+  # The image builder runs init once per TARGET_ARCH. Do not copy a host build
+  # into another architecture's image when no explicit Rust target was supplied.
+  case "${TARGET_ARCH:-}" in
+    amd64) BUILD_ZTUNNEL_TARGET="${BUILD_ZTUNNEL_TARGET:-x86_64-unknown-linux-gnu}" ;;
+    arm64) BUILD_ZTUNNEL_TARGET="${BUILD_ZTUNNEL_TARGET:-aarch64-unknown-linux-gnu}" ;;
+    *) echo "Unsupported ztunnel image architecture: ${TARGET_ARCH:-unset}"; return 1 ;;
+  esac
+  case "${BUILD_ZTUNNEL_TARGET}" in
+    *[!a-zA-Z0-9_-]*) echo "Invalid Rust target: ${BUILD_ZTUNNEL_TARGET}"; return 1 ;;
+  esac
+  case "${TARGET_ARCH}:${BUILD_ZTUNNEL_TARGET}" in
+    amd64:x86_64-*-linux-*|arm64:aarch64-*-linux-*) ;;
+    *) echo "Rust target ${BUILD_ZTUNNEL_TARGET} does not match linux/${TARGET_ARCH}"; return 1 ;;
+  esac
 
   if ! which cargo; then
     echo "the rust toolchain (cargo, etc) is required for building ztunnel"
@@ -119,7 +138,7 @@ function maybe_build_ztunnel() {
   fi
 
   pushd "${BUILD_ZTUNNEL_REPO}"
-  cargo build --profile="${BUILD_ZTUNNEL_PROFILE:-dev}" ${BUILD_ZTUNNEL_TARGET:+--target=${BUILD_ZTUNNEL_TARGET}}
+  cargo build --profile="${BUILD_ZTUNNEL_PROFILE:-dev}" "--target=${BUILD_ZTUNNEL_TARGET}"
 
   local ZTUNNEL_BIN_PATH
   if [[ "${BUILD_ZTUNNEL_PROFILE:-dev}" == "dev" ]]; then
@@ -146,6 +165,9 @@ ISTIO_ZTUNNEL_LINUX_RELEASE_DIR="${ISTIO_ZTUNNEL_LINUX_RELEASE_DIR:-${TARGET_OUT
 ISTIO_ZTUNNEL_LINUX_DEBUG_DIR="${ISTIO_ZTUNNEL_LINUX_DEBUG_DIR:-${TARGET_OUT_LINUX}/debug}"
 ISTIO_ZTUNNEL_LINUX_RELEASE_PATH="${ISTIO_ZTUNNEL_LINUX_RELEASE_PATH:-${ISTIO_ZTUNNEL_LINUX_RELEASE_DIR}/${ISTIO_ZTUNNEL_LINUX_RELEASE_NAME}}"
 
+if [[ "${BUILD_ZTUNNEL_REPO:-}" != "" || "${BUILD_ZTUNNEL:-}" != "" ]]; then
+  maybe_build_ztunnel
+  exit 0
+fi
 set_download_command
-maybe_build_ztunnel
 download_ztunnel_if_necessary "${ISTIO_ZTUNNEL_RELEASE_URL}" "$ISTIO_ZTUNNEL_LINUX_RELEASE_PATH" "ztunnel"

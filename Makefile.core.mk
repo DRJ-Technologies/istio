@@ -49,8 +49,11 @@ endif
 export VERSION
 
 # Base version of Istio image to use
-BASE_VERSION ?= master-2026-08-30T19-01-37
+BASE_VERSION ?= 1.30-2026-09-30T19-02-04
 ISTIO_BASE_REGISTRY ?= registry.istio.io/release
+# Full references take precedence over the registry/tag defaults for these bases.
+ISTIO_IPTABLES_BASE_IMAGE ?= registry.istio.io/release/iptables@sha256:c56ddcd23fc3abb17909e7be62415c820c9713b9a20fc482685cdbcc669249b5
+ISTIO_DISTROLESS_BASE_IMAGE ?= registry.istio.io/release/distroless@sha256:7952c9da0616f71111c197b8cf20563ea4139286f317c4f62af2ee633ebe2e6e
 
 export GO111MODULE ?= on
 export GOPROXY ?= https://proxy.golang.org

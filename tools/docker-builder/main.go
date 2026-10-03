@@ -40,6 +40,8 @@ func main() {
 
 	rootCmd.Flags().StringVar(&globalArgs.BaseVersion, "base-version", globalArgs.BaseVersion, "base version to use")
 	rootCmd.Flags().StringVar(&globalArgs.BaseImageRegistry, "image-base-registry", globalArgs.BaseImageRegistry, "base image registry to use")
+	rootCmd.Flags().StringVar(&globalArgs.IptablesBaseImage, "iptables-base-image", globalArgs.IptablesBaseImage, "full iptables base reference; empty uses the base registry/tag")
+	rootCmd.Flags().StringVar(&globalArgs.DistrolessBaseImage, "distroless-base-image", globalArgs.DistrolessBaseImage, "full distroless base reference; empty uses the base registry/tag")
 	rootCmd.Flags().StringVar(&globalArgs.ProxyVersion, "proxy-version", globalArgs.ProxyVersion, "proxy version to use")
 	rootCmd.Flags().StringVar(&globalArgs.ZtunnelVersion, "ztunnel-version", globalArgs.ZtunnelVersion, "ztunnel version to use")
 	rootCmd.Flags().StringVar(&globalArgs.IstioVersion, "istio-version", globalArgs.IstioVersion, "istio version to use")
