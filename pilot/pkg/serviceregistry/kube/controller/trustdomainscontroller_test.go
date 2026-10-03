@@ -21,7 +21,10 @@ import (
 	"time"
 
 	v1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/kubernetes/fake"
 
 	meshconfig "istio.io/api/mesh/v1alpha1"
 	"istio.io/istio/pilot/pkg/features"
@@ -89,6 +92,82 @@ func TestTrustDomainsController(t *testing.T) {
 			t.Fatalf("%s namespace should not have %s configmap", ns, TrustDomainsNamespaceConfigMap)
 		}
 	}
+}
+
+func TestTrustDomainsControllerWatchNamespace(t *testing.T) {
+	test.SetForTest(t, &features.InformerWatchNamespace, "owned")
+	test.SetForTest(t, &features.SkipValidateTrustDomain, false)
+	outside := &v1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Name: TrustDomainsNamespaceConfigMap, Namespace: "outside-existing"},
+		Data:       trustDomainsCM("external-owner.example\n"),
+	}
+	client := kube.NewFakeClient(
+		&v1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "owned"}},
+		&v1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "outside-absent"}},
+		&v1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "outside-existing"}},
+		outside,
+	)
+	t.Cleanup(client.Shutdown)
+	watcher := meshwatcher.NewTestWatcher(&meshconfig.MeshConfig{TrustDomain: "local.example"})
+	stop := make(chan struct{})
+	c := NewTrustDomainsController(client, watcher)
+	client.RunAndWait(stop)
+	done := make(chan struct{})
+	go func() {
+		c.Run(stop)
+		close(done)
+	}()
+	shutdown := func() {
+		select {
+		case <-stop:
+		default:
+			close(stop)
+		}
+		select {
+		case <-done:
+		case <-time.After(5 * time.Second):
+			t.Fatal("trust domain controller did not stop")
+		}
+		// Drain queued writes before making negative assertions, without a timing sleep.
+		select {
+		case <-c.queue.Closed():
+		case <-time.After(5 * time.Second):
+			t.Fatal("trust domain queue did not drain")
+		}
+	}
+	t.Cleanup(shutdown)
+	expectTrustDomainsConfigMap(t, client, "owned", "local.example\n")
+
+	watcher.Set(&meshconfig.MeshConfig{
+		TrustDomain: "local.example",
+		CaCertificates: []*meshconfig.MeshConfig_CertificateData{
+			{TrustDomains: []string{"peer.example"}},
+		},
+	})
+	expectTrustDomainsConfigMap(t, client, "owned", "local.example\npeer.example\n")
+	watcher.Set(&meshconfig.MeshConfig{TrustDomain: "local.example"})
+	expectTrustDomainsConfigMap(t, client, "owned", "local.example\n")
+
+	// Stale or independently queued Namespace and ConfigMap keys cannot bypass scope.
+	assert.NoError(t, c.reconcile(types.NamespacedName{Name: "outside-absent"}))
+	assert.NoError(t, c.reconcile(types.NamespacedName{Namespace: "outside-existing", Name: TrustDomainsNamespaceConfigMap}))
+	shutdown()
+	for _, action := range client.Kube().(*fake.Clientset).Actions() {
+		if action.GetResource().Resource != "configmaps" || action.GetNamespace() == "owned" {
+			continue
+		}
+		switch action.GetVerb() {
+		case "create", "update", "patch", "delete":
+			t.Errorf("attempted %s of ConfigMap outside watched namespace: %s", action.GetVerb(), action.GetNamespace())
+		}
+	}
+	_, err := client.Kube().CoreV1().ConfigMaps("outside-absent").Get(context.TODO(), TrustDomainsNamespaceConfigMap, metav1.GetOptions{})
+	if !apierrors.IsNotFound(err) {
+		t.Fatalf("outside namespace ConfigMap must remain absent: %v", err)
+	}
+	got, err := client.Kube().CoreV1().ConfigMaps("outside-existing").Get(context.TODO(), TrustDomainsNamespaceConfigMap, metav1.GetOptions{})
+	assert.NoError(t, err)
+	assert.Equal(t, got.Data, trustDomainsCM("external-owner.example\n"))
 }
 
 // Certificate-associated domains are sufficient without aliases or skipped validation.

@@ -77,13 +77,10 @@ func NewTrustDomainsController(kubeClient kube.Client, meshWatcher mesh.Watcher)
 	})
 
 	c.configmaps.AddEventHandler(controllers.FilteredObjectSpecHandler(c.queue.AddObject, func(o controllers.Object) bool {
-		return !c.ignoredNamespaces.Contains(o.GetNamespace())
+		return c.shouldProcessNamespace(o.GetNamespace())
 	}))
 	c.namespaces.AddEventHandler(controllers.FilteredObjectSpecHandler(c.queue.AddObject, func(o controllers.Object) bool {
-		if features.InformerWatchNamespace != "" && features.InformerWatchNamespace != o.GetName() {
-			return false
-		}
-		return !c.ignoredNamespaces.Contains(o.GetName())
+		return c.shouldProcessNamespace(o.GetName())
 	}))
 	return c
 }
@@ -94,16 +91,21 @@ func (c *TrustDomainsController) Run(stop <-chan struct{}) {
 		c.queue.ShutDownEarly()
 		return
 	}
-	// The trust domains come from the mesh config, so rewrite them in every namespace when it changes.
+	// The trust domains come from the mesh config, so rewrite them in every watched namespace when it changes.
 	reg := c.meshWatcher.AddMeshHandler(c.syncAll)
 	defer c.meshWatcher.DeleteMeshHandler(reg)
 	c.queue.Run(stop)
 	controllers.ShutdownAll(c.configmaps, c.namespaces)
 }
 
+func (c *TrustDomainsController) shouldProcessNamespace(ns string) bool {
+	return !c.ignoredNamespaces.Contains(ns) &&
+		(features.InformerWatchNamespace == "" || features.InformerWatchNamespace == ns)
+}
+
 func (c *TrustDomainsController) syncAll() {
 	for _, ns := range c.namespaces.List("", labels.Everything()) {
-		if ns.Status.Phase != v1.NamespaceTerminating && !c.ignoredNamespaces.Contains(ns.Name) {
+		if ns.Status.Phase != v1.NamespaceTerminating && c.shouldProcessNamespace(ns.Name) {
 			c.queue.Add(types.NamespacedName{Name: ns.Name})
 		}
 	}
@@ -114,6 +116,9 @@ func (c *TrustDomainsController) reconcile(o types.NamespacedName) error {
 	if ns == "" {
 		// For Namespace object, it will not have o.Namespace field set
 		ns = o.Name
+	}
+	if !c.shouldProcessNamespace(ns) {
+		return nil
 	}
 	return k8s.InsertDataToConfigMap(
 		c.configmaps,
