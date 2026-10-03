@@ -1,0 +1,103 @@
+name: Native OCI build
+
+on:
+  workflow_dispatch:
+    inputs:
+      artifact_tag:
+        description: Immutable fork tag, including the distroless variant
+        required: true
+        default: 1.31.1-drj.1-distroless
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    env:
+      VERSION: 1.31.1
+      BUILD_WITH_CONTAINER: '0'
+      CGO_ENABLED: '0'
+      HUB: localhost/istio
+      BUILD_ZTUNNEL_PROFILE: release
+      CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+      CC_aarch64_unknown_linux_gnu: aarch64-linux-gnu-gcc
+      CXX_aarch64_unknown_linux_gnu: aarch64-linux-gnu-g++
+      AR_aarch64_unknown_linux_gnu: aarch64-linux-gnu-ar
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Select artifact tag
+        env:
+          INPUT_ARTIFACT_TAG: ${{ inputs.artifact_tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          stem="${INPUT_ARTIFACT_TAG%-distroless}"
+          release="${stem##*-drj.}"
+          if [[ "$INPUT_ARTIFACT_TAG" != "$VERSION-drj.$release-distroless" || ! "$release" =~ ^[1-9][0-9]*$ ]]; then
+            echo 'Expected an immutable fork tag for the selected component version and distroless variant' >&2
+            exit 1
+          fi
+          printf 'TAG=%s\n' "$stem" >> "$GITHUB_ENV"
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          repository: DRJ-Technologies/ztunnel
+          ref: main
+          path: ztunnel
+          persist-credentials: false
+      - name: Check companion main against native dependency
+        shell: bash
+        run: |
+          set -euo pipefail
+          expected="$(python3 -c 'import json; print(next(x["lastStableSHA"] for x in json.load(open("istio.deps")) if x["name"] == "ZTUNNEL_REPO_SHA"))')"
+          test "$(git -C ztunnel rev-parse HEAD)" = "$expected"
+          printf 'BUILD_ZTUNNEL_REPO=%s/ztunnel\n' "$GITHUB_WORKSPACE" >> "$GITHUB_ENV"
+          git rev-parse HEAD
+          git -C ztunnel rev-parse HEAD
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff
+        with:
+          go-version-file: go.mod
+          cache: false
+      - name: Prepare disposable hosted runner toolchain and storage
+        shell: bash
+        run: |
+          set -euo pipefail
+          # These unused SDKs are only removed on this disposable hosted runner.
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends cmake clang libclang-dev protobuf-compiler gcc-aarch64-linux-gnu g++-aarch64-linux-gnu binutils-aarch64-linux-gnu
+          rust_version="$(python3 -c 'import tomllib; print(tomllib.load(open("ztunnel/Cargo.toml", "rb"))["package"]["rust-version"])')"
+          rustup toolchain install "$rust_version" --profile minimal --target x86_64-unknown-linux-gnu,aarch64-unknown-linux-gnu
+          printf 'RUSTUP_TOOLCHAIN=%s\n' "$rust_version" >> "$GITHUB_ENV"
+          mkdir -p "$RUNNER_TEMP/istio-tmp" "$RUNNER_TEMP/istio-oci"
+          printf 'TMPDIR=%s/istio-tmp\n' "$RUNNER_TEMP" >> "$GITHUB_ENV"
+          df -h "$GITHUB_WORKSPACE" "$RUNNER_TEMP"
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f
+        id: builder
+        with:
+          version: v0.30.1
+          driver: docker-container
+          driver-opts: image=moby/buildkit:v0.26.2
+          use: false
+      - name: Build native multiarch OCI layouts
+        env:
+          OCI_BUILDER: ${{ steps.builder.outputs.name }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          unset BUILD_ZTUNNEL_TARGET BUILD_ZTUNNEL SKIP_MAKE BUILDX_NO_DEFAULT_ATTESTATIONS
+          ./tools/docker --targets pilot,proxyv2,install-cni,ztunnel --variants distroless \
+            --architectures linux/amd64,linux/arm64 \
+            --oci-output-dir "$RUNNER_TEMP/istio-oci" --oci-builder "$OCI_BUILDER"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: istio-oci-${{ inputs.artifact_tag }}
+          path: ${{ runner.temp }}/istio-oci/
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
