@@ -25,6 +25,7 @@ import (
 	securityclient "istio.io/client-go/pkg/apis/security/v1"
 	"istio.io/istio/pilot/pkg/features"
 	"istio.io/istio/pilot/pkg/model"
+	"istio.io/istio/pilot/pkg/security/trustdomain"
 	"istio.io/istio/pkg/config/schema/kind"
 	"istio.io/istio/pkg/log"
 	"istio.io/istio/pkg/maps"
@@ -394,7 +395,13 @@ func convertPeerAuthentication(rootNamespace string, cfg, nsCfg, rootCfg *securi
 	return opol
 }
 
-func convertAuthorizationPolicy(rootns string, obj *securityclient.AuthorizationPolicy) (*security.Authorization, *model.StatusMessage) {
+// tdBundle is the local trust domain and its aliases. As for sidecars and waypoints, a source principal in any of
+// them, or in "cluster.local", matches that identity in all of them.
+func convertAuthorizationPolicy(
+	rootns string,
+	tdBundle trustdomain.Bundle,
+	obj *securityclient.AuthorizationPolicy,
+) (*security.Authorization, *model.StatusMessage) {
 	pol := &obj.Spec
 
 	var dryRun bool
@@ -455,7 +462,7 @@ func convertAuthorizationPolicy(rootns string, obj *securityclient.Authorization
 	rulesWithL7 := sets.New[string]()
 
 	for _, rule := range pol.Rules {
-		rules, foundL7 := handleRule(action, rule, obj.Namespace)
+		rules, foundL7 := handleRule(action, rule, obj.Namespace, tdBundle)
 		if rules != nil {
 			rg := &security.Group{
 				Rules: rules,
@@ -530,7 +537,10 @@ func httpSources(s *v1beta1.Source) []string {
 	return foundUnsupportedSources
 }
 
-func handleRule(action security.Action, rule *v1beta1.Rule, ruleNamespace string) ([]*security.Rules, []string) {
+func handleRule(action security.Action, rule *v1beta1.Rule, ruleNamespace string, tdBundle trustdomain.Bundle) ([]*security.Rules, []string) {
+	principalsToMatch := func(principals []string) []*security.StringMatch {
+		return stringToMatch(tdBundle.ReplaceTrustDomainAliases(principals))
+	}
 	l7RuleFound := false
 	httpMatch := sets.New[string]()
 	toMatches := []*security.Match{}
@@ -562,8 +572,8 @@ func handleRule(action security.Action, rule *v1beta1.Rule, ruleNamespace string
 			NotNamespaces:      stringToMatch(op.NotNamespaces),
 			ServiceAccounts:    stringToServiceAccountMatch(op.ServiceAccounts, ruleNamespace),
 			NotServiceAccounts: stringToServiceAccountMatch(op.NotServiceAccounts, ruleNamespace),
-			Principals:         stringToMatch(op.Principals),
-			NotPrincipals:      stringToMatch(op.NotPrincipals),
+			Principals:         principalsToMatch(op.Principals),
+			NotPrincipals:      principalsToMatch(op.NotPrincipals),
 		}
 		fromMatches = append(fromMatches, match)
 	}
@@ -583,13 +593,13 @@ func handleRule(action security.Action, rule *v1beta1.Rule, ruleNamespace string
 		}
 		positiveMatch := &security.Match{
 			Namespaces:       whenMatch("source.namespace", when, false, stringToMatch),
-			Principals:       whenMatch("source.principal", when, false, stringToMatch),
+			Principals:       whenMatch("source.principal", when, false, principalsToMatch),
 			SourceIps:        whenMatch("source.ip", when, false, stringToIP),
 			DestinationPorts: whenMatch("destination.port", when, false, stringToPort),
 			DestinationIps:   whenMatch("destination.ip", when, false, stringToIP),
 
 			NotNamespaces:       whenMatch("source.namespace", when, true, stringToMatch),
-			NotPrincipals:       whenMatch("source.principal", when, true, stringToMatch),
+			NotPrincipals:       whenMatch("source.principal", when, true, principalsToMatch),
 			NotSourceIps:        whenMatch("source.ip", when, true, stringToIP),
 			NotDestinationPorts: whenMatch("destination.port", when, true, stringToPort),
 			NotDestinationIps:   whenMatch("destination.ip", when, true, stringToIP),

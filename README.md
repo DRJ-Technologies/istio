@@ -98,6 +98,21 @@ component of Ambient mesh.
 > [!NOTE]
 > Only the `istio/api` and `istio/client-go` repositories expose stable interfaces intended for direct usage as libraries.
 
+## Fork trust-domain support
+
+The paired ztunnel backport consumes `istio-trust-domains` from istiod and reloads
+accepted domains without restarting. Its chart value `trustDomainsConfigMapName`
+must match istiod's `PILOT_TRUST_DOMAINS_CONFIGMAP` when overriding the default.
+For this deployment, leave `trustDomainAliases` unused and
+`PILOT_SKIP_VALIDATE_TRUST_DOMAIN` false. Explicit `caCertificates[].trustDomains`
+can qualify same-root peers in another domain only when their certificate chain
+is already trusted; accepting a domain does not add a trusted signer.
+
+This backport does not implement PCDS delivery of additional roots for
+`ISTIO_MULTIROOT_MESH`. Native CA-response concatenated root bundles remain
+supported and unchanged. Separate-root federation remains unqualified; preserve
+production, nonproduction and build root boundaries.
+
 ## Issue management
 
 We use GitHub to track all of our bugs and feature requests. Each issue we track has a variety of metadata:
