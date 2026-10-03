@@ -16,6 +16,9 @@ jobs:
     if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-24.04
     timeout-minutes: 180
+    defaults:
+      run:
+        working-directory: istio
     env:
       VERSION: 1.31.1
       BUILD_WITH_CONTAINER: '0'
@@ -30,6 +33,7 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           ref: ${{ github.sha }}
+          path: istio
           persist-credentials: false
       - name: Select artifact tag
         env:
@@ -55,13 +59,13 @@ jobs:
         run: |
           set -euo pipefail
           expected="$(python3 -c 'import json; print(next(x["lastStableSHA"] for x in json.load(open("istio.deps")) if x["name"] == "ZTUNNEL_REPO_SHA"))')"
-          test "$(git -C ztunnel rev-parse HEAD)" = "$expected"
+          test "$(git -C "$GITHUB_WORKSPACE/ztunnel" rev-parse HEAD)" = "$expected"
           printf 'BUILD_ZTUNNEL_REPO=%s/ztunnel\n' "$GITHUB_WORKSPACE" >> "$GITHUB_ENV"
           git rev-parse HEAD
-          git -C ztunnel rev-parse HEAD
+          git -C "$GITHUB_WORKSPACE/ztunnel" rev-parse HEAD
       - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff
         with:
-          go-version-file: go.mod
+          go-version-file: istio/go.mod
           cache: false
       - name: Prepare disposable hosted runner toolchain and storage
         shell: bash
@@ -71,7 +75,7 @@ jobs:
           sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends cmake clang libclang-dev protobuf-compiler gcc-aarch64-linux-gnu g++-aarch64-linux-gnu binutils-aarch64-linux-gnu
-          rust_version="$(python3 -c 'import tomllib; print(tomllib.load(open("ztunnel/Cargo.toml", "rb"))["package"]["rust-version"])')"
+          rust_version="$(python3 -c 'import os, pathlib, tomllib; print(tomllib.load(open(pathlib.Path(os.environ["BUILD_ZTUNNEL_REPO"]) / "Cargo.toml", "rb"))["package"]["rust-version"])')"
           rustup toolchain install "$rust_version" --profile minimal --target x86_64-unknown-linux-gnu,aarch64-unknown-linux-gnu
           printf 'RUSTUP_TOOLCHAIN=%s\n' "$rust_version" >> "$GITHUB_ENV"
           mkdir -p "$RUNNER_TEMP/istio-tmp" "$RUNNER_TEMP/istio-oci"
@@ -90,10 +94,29 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          check_source() {
+            local repo="$1" expected="$2" status
+            status="$(git -C "$repo" status --porcelain=v1 --untracked-files=all)"
+            printf 'Source status: %s\n%s\n' "$repo" "$status"
+            git -C "$repo" diff --stat HEAD --
+            test "$(git -C "$repo" rev-parse HEAD)" = "$expected"
+            if [[ -n "$status" ]]; then
+              echo 'Refusing modified or untracked build source' >&2
+              exit 1
+            fi
+          }
+          check_build_sources() {
+            check_source . "$GITHUB_SHA"
+            local expected
+            expected="$(python3 -c 'import json; print(next(x["lastStableSHA"] for x in json.load(open("istio.deps")) if x["name"] == "ZTUNNEL_REPO_SHA"))')"
+            check_source "$BUILD_ZTUNNEL_REPO" "$expected"
+          }
+          check_build_sources
           unset BUILD_ZTUNNEL_TARGET BUILD_ZTUNNEL SKIP_MAKE BUILDX_NO_DEFAULT_ATTESTATIONS
           ./tools/docker --targets pilot,proxyv2,install-cni,ztunnel --variants distroless \
             --architectures linux/amd64,linux/arm64 \
             --oci-output-dir "$RUNNER_TEMP/istio-oci" --oci-builder "$OCI_BUILDER"
+          check_build_sources
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: istio-oci-${{ inputs.artifact_tag }}
