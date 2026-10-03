@@ -117,6 +117,18 @@ function maybe_build_ztunnel() {
     return 1
   fi
 
+  # The image builder runs init once per TARGET_ARCH. Do not copy a host build
+  # into another architecture's image when no explicit Rust target was supplied.
+  case "${TARGET_ARCH:-}" in
+    amd64) BUILD_ZTUNNEL_TARGET="${BUILD_ZTUNNEL_TARGET:-x86_64-unknown-linux-gnu}" ;;
+    arm64) BUILD_ZTUNNEL_TARGET="${BUILD_ZTUNNEL_TARGET:-aarch64-unknown-linux-gnu}" ;;
+    *) echo "Unsupported ztunnel image architecture: ${TARGET_ARCH:-unset}"; return 1 ;;
+  esac
+  case "${TARGET_ARCH}:${BUILD_ZTUNNEL_TARGET}" in
+    amd64:x86_64-*-linux-*|arm64:aarch64-*-linux-*) ;;
+    *) echo "Rust target ${BUILD_ZTUNNEL_TARGET} does not match linux/${TARGET_ARCH}"; return 1 ;;
+  esac
+
   if ! which cargo; then
     echo "the rust toolchain (cargo, etc) is required for building ztunnel"
     return 1
