@@ -17,10 +17,17 @@ package ambient
 import (
 	"fmt"
 
+	v1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/fields"
+
 	"istio.io/istio/pkg/cluster"
 	"istio.io/istio/pkg/config/constants"
 	"istio.io/istio/pkg/config/mesh/kubemesh"
 	"istio.io/istio/pkg/config/mesh/meshwatcher"
+	"istio.io/istio/pkg/kube"
+	"istio.io/istio/pkg/kube/controllers"
+	"istio.io/istio/pkg/kube/kclient"
 	"istio.io/istio/pkg/kube/krt"
 	"istio.io/istio/pkg/kube/multicluster"
 	"istio.io/istio/pkg/log"
@@ -81,11 +88,10 @@ func buildGlobalMeshConfigCollections(
 			// N.B the cluster stop is used here, never the top-level stop, so the informer goes away with
 			// the cluster.
 			clusterOpts := krt.NewOptionsBuilder(c.GetStop(), fmt.Sprintf("ambient/mesh[%s]/", c.ID), opts.Debugger())
-			source := kubemesh.NewConfigMapSource(
+			source := remoteMeshConfigSource(
 				c.Client,
 				options.SystemNamespace,
 				getMeshConfigMapName(options.Revision),
-				kubemesh.MeshConfigKey,
 				clusterOpts,
 			)
 			mesh := meshwatcher.NewCollection(clusterOpts, source)
@@ -121,6 +127,38 @@ func buildGlobalMeshConfigCollections(
 		ClusterMeshConfigs: ClusterMeshConfigs,
 		localClusterID:     options.ClusterID,
 	}
+}
+
+// Remote mesh data is optional. The cache may remain unsynced when remote reads
+// are denied, so register changes through a native trigger and read only cached
+// data. Mandatory local and KRT collection synchronization stays unchanged.
+func remoteMeshConfigSource(client kube.Client, namespace, name string, opts krt.OptionsBuilder) meshwatcher.MeshConfigSource {
+	clt := kclient.NewFiltered[*v1.ConfigMap](client, kclient.Filter{
+		Namespace:     namespace,
+		FieldSelector: fields.OneTermEqualSelector(metav1.ObjectNameField, name).String(),
+	})
+	changed := krt.NewRecomputeTrigger(true, opts.WithName("RemoteMeshConfigChanged")...)
+	clt.AddEventHandler(controllers.ObjectHandler(func(controllers.Object) {
+		changed.TriggerRecomputation()
+	}))
+	clt.Start(opts.Stop())
+	go func() {
+		<-opts.Stop()
+		clt.ShutdownHandlers()
+	}()
+	return krt.NewSingleton(func(ctx krt.HandlerContext) *string {
+		// Subscribe before reading the cache so a concurrent event cannot be lost.
+		changed.MarkDependant(ctx)
+		cm := clt.Get(name, namespace)
+		if cm == nil {
+			return nil
+		}
+		data, found := cm.Data[kubemesh.MeshConfigKey]
+		if !found {
+			return nil
+		}
+		return &data
+	}, opts.WithName("RemoteMeshConfig_"+name)...)
 }
 
 func localClusterMeshConfig(
