@@ -91,6 +91,21 @@ func TestTrustDomainsController(t *testing.T) {
 	}
 }
 
+// Certificate-associated domains are sufficient without aliases or skipped validation.
+// Removing the explicit domain narrows the published set back to the local domain.
+func TestTrustDomainsDataExplicitCertificateDomains(t *testing.T) {
+	test.SetForTest(t, &features.SkipValidateTrustDomain, false)
+	m := &meshconfig.MeshConfig{
+		TrustDomain: "local.example",
+		CaCertificates: []*meshconfig.MeshConfig_CertificateData{
+			{TrustDomains: []string{"peer.example", "local.example", "peer.example"}},
+		},
+	}
+	assert.Equal(t, string(trustDomainsData(m)), "local.example\npeer.example\n")
+	m.CaCertificates = nil
+	assert.Equal(t, string(trustDomainsData(m)), "local.example\n")
+}
+
 func TestTrustDomainsDataSkipValidation(t *testing.T) {
 	mesh := &meshconfig.MeshConfig{TrustDomain: "cluster.local", TrustDomainAliases: []string{"old.local"}}
 	assert.Equal(t, string(trustDomainsData(mesh)), "cluster.local\nold.local\n")

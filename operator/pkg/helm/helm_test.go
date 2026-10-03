@@ -28,6 +28,7 @@ import (
 	"helm.sh/helm/v4/pkg/chart/common"
 	commonutil "helm.sh/helm/v4/pkg/chart/common/util"
 	"helm.sh/helm/v4/pkg/engine"
+	appsv1 "k8s.io/api/apps/v1"
 	"sigs.k8s.io/yaml"
 
 	"istio.io/istio/istioctl/pkg/install/k8sversion"
@@ -385,6 +386,63 @@ func TestRender(t *testing.T) {
 			if got != want {
 				t.Fatal(cmp.Diff(got, want))
 			}
+		})
+	}
+}
+
+func TestZtunnelTrustDomainsMount(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		want string
+	}{
+		{want: "istio-trust-domains"},
+		{name: "peer-trust-domains", want: "peer-trust-domains"},
+	} {
+		t.Run(tc.want, func(t *testing.T) {
+			iop := values.Map{"spec": map[string]any{"values": map[string]any{
+				"trustDomainsConfigMapName": tc.name,
+			}}}
+			mfs, _, err := renderWithOptions("ztunnel", "istio-system", "ztunnel", iop, false)
+			require.NoError(t, err)
+			var ds appsv1.DaemonSet
+			found := false
+			for _, mf := range mfs {
+				if mf.GetKind() == "DaemonSet" {
+					require.NoError(t, yaml.Unmarshal([]byte(mf.Content), &ds))
+					found = true
+				}
+			}
+			require.True(t, found)
+			foundVolume, foundMount, foundPath := false, false, false
+			for _, v := range ds.Spec.Template.Spec.Volumes {
+				if v.Name == "trust-domains" {
+					require.NotNil(t, v.ConfigMap)
+					require.Equal(t, tc.want, v.ConfigMap.Name)
+					require.NotNil(t, v.ConfigMap.Optional)
+					require.True(t, *v.ConfigMap.Optional)
+					foundVolume = true
+				}
+			}
+			for _, c := range ds.Spec.Template.Spec.Containers {
+				if c.Name != "istio-proxy" {
+					continue
+				}
+				for _, v := range c.VolumeMounts {
+					if v.Name == "trust-domains" {
+						require.Equal(t, "/var/run/secrets/istio/trust-domains", v.MountPath)
+						require.True(t, v.ReadOnly)
+						require.Empty(t, v.SubPath) // Projected updates must remain visible.
+						foundMount = true
+					}
+				}
+				for _, e := range c.Env {
+					if e.Name == "TRUST_DOMAINS_PATH" {
+						require.Equal(t, "/var/run/secrets/istio/trust-domains/trust-domains", e.Value)
+						foundPath = true
+					}
+				}
+			}
+			require.True(t, foundVolume && foundMount && foundPath)
 		})
 	}
 }
