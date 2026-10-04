@@ -133,7 +133,10 @@ func (cb *ClusterBuilder) buildUpstreamClusterTLSContext(opts *buildClusterOpts,
 		}
 	}
 
-	if sec_model.UsesWorkloadDomainBundles(cb.node) && tls.CredentialName == credentials.BuiltinGatewaySecretTypeURI {
+	// ClusterBuilder retains the actual proxy metadata, rather than a Proxy.
+	// These mapped-context helpers use only that native metadata selector.
+	proxy := &model.Proxy{Metadata: cb.proxyMetadata}
+	if sec_model.UsesWorkloadDomainBundles(proxy) && tls.CredentialName == credentials.BuiltinGatewaySecretTypeURI {
 		// The built-in credential resolves to mapped ROOTCA. InsecureSkipVerify
 		// must not remove that reference and bypass the selected-domain store.
 		tls = tls.DeepCopy()
@@ -160,7 +163,7 @@ func (cb *ClusterBuilder) buildUpstreamClusterTLSContext(opts *buildClusterOpts,
 				ValidationContextSdsSecretConfig: sec_model.ConstructSdsSecretConfig(sec_model.SDSRootResourceName),
 			},
 		}
-		if sec_model.UsesWorkloadDomainBundles(cb.node) {
+		if sec_model.UsesWorkloadDomainBundles(proxy) {
 			sec_model.ApplyMappedPeerIdentity(tlsContext.CommonTlsContext.GetCombinedValidationContext().DefaultValidationContext,
 				tls.SubjectAltNames)
 		}
@@ -201,8 +204,8 @@ func (cb *ClusterBuilder) buildUpstreamClusterTLSContext(opts *buildClusterOpts,
 	}
 	// Compliance for Envoy TLS upstreams.
 	if tlsContext != nil {
-		sec_model.ApplyMappedRootContext(cb.node, tlsContext.CommonTlsContext, tls.CaCrl)
-		sec_model.DisableMappedUpstreamResumption(cb.node, tlsContext)
+		sec_model.ApplyMappedRootContext(proxy, tlsContext.CommonTlsContext, tls.CaCrl)
+		sec_model.DisableMappedUpstreamResumption(proxy, tlsContext)
 		sec_model.EnforceCompliance(tlsContext.CommonTlsContext)
 	}
 	return tlsContext, nil

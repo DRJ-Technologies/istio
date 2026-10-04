@@ -15,6 +15,8 @@
 package core
 
 import (
+	"regexp"
+	"strings"
 	"testing"
 
 	cluster "github.com/envoyproxy/go-control-plane/envoy/config/cluster/v3"
@@ -27,7 +29,9 @@ import (
 	istionetworking "istio.io/istio/pilot/pkg/networking"
 	authnutils "istio.io/istio/pilot/pkg/security/authn/utils"
 	secmodel "istio.io/istio/pilot/pkg/security/model"
+	"istio.io/istio/pkg/config/host"
 	"istio.io/istio/pkg/config/mesh"
+	"istio.io/istio/pkg/config/protocol"
 	"istio.io/istio/pkg/credentials"
 	"istio.io/istio/pkg/security"
 )
@@ -126,5 +130,61 @@ func TestDomainBundleActualMeshContextConsumers(t *testing.T) {
 		len(validation.DefaultValidationContext.MatchTypedSubjectAltNames) != 0 ||
 		validation.DefaultValidationContext.MatchSubjectAltNames[0].GetExact() != "external.example" {
 		t.Fatal("external DNS TLS became workload trust")
+	}
+}
+
+func TestDomainBundleNativeGatewayRejectsOriginalPinInputs(t *testing.T) {
+	proxy := &model.Proxy{Type: model.Router, Metadata: &model.NodeMetadata{}}
+	config := mesh.DefaultProxyConfig()
+	config.ProxyMetadata = map[string]string{security.SPIFFEBundleMapPathEnv: "/var/run/secrets/istio/trust-domains/spiffe-bundle-map.json"}
+	proxy.Metadata.ProxyConfig = (*model.NodeMetaProxyConfig)(config)
+	push := model.NewPushContext()
+	push.Mesh = mesh.DefaultMeshConfig()
+	for _, mode := range []networking.ServerTLSSettings_TLSmode{networking.ServerTLSSettings_ISTIO_MUTUAL, networking.ServerTLSSettings_MUTUAL} {
+		for _, pin := range []string{"hash", "spki"} {
+			settings := &networking.ServerTLSSettings{Mode: mode, SubjectAltNames: []string{"spiffe://foreign.example/ns/target/sa/expected"}}
+			if mode == networking.ServerTLSSettings_MUTUAL {
+				settings.CredentialName = credentials.BuiltinGatewaySecretTypeURI
+			}
+			if pin == "hash" {
+				settings.VerifyCertificateHash = []string{strings.Repeat("0", 64)}
+			} else {
+				settings.VerifyCertificateSpki = []string{"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="}
+			}
+			context := BuildListenerTLSContext(settings, proxy, push, istionetworking.TransportProtocolTCP, true)
+			if err := context.ValidateAll(); err != nil {
+				t.Fatalf("denying context would be rejected: %v", err)
+			}
+			validation := context.CommonTlsContext.GetCombinedValidationContext().DefaultValidationContext
+			if len(validation.MatchTypedSubjectAltNames) != 1 || len(validation.VerifyCertificateHash) != 0 || len(validation.VerifyCertificateSpki) != 0 {
+				t.Fatal("original pin input was lost or retained as an unsupported decode input")
+			}
+			match := validation.MatchTypedSubjectAltNames[0]
+			if match.SanType != tls.SubjectAltNameMatcher_URI || match.Matcher.GetSafeRegex() == nil ||
+				regexp.MustCompile(match.Matcher.GetSafeRegex().Regex).MatchString(settings.SubjectAltNames[0]) {
+				t.Fatal("original pin input did not refuse the otherwise valid peer")
+			}
+		}
+	}
+}
+
+func TestDomainBundleNativeCDSCacheSeparatesSelectedContexts(t *testing.T) {
+	port := &model.Port{Name: "tcp", Port: 8080, Protocol: protocol.TCP}
+	service := &model.Service{Hostname: host.Name("native.default.svc.cluster.local"), Ports: []*model.Port{port},
+		Attributes: model.ServiceAttributes{Namespace: "default"}, Resolution: model.ClientSideLB}
+	cg := NewConfigGenTest(t, TestOptions{Services: []*model.Service{service}})
+	key := func(path string) any {
+		config := mesh.DefaultProxyConfig()
+		config.ProxyMetadata = map[string]string{security.SPIFFEBundleMapPathEnv: path}
+		proxy := cg.SetupProxy(&model.Proxy{Metadata: &model.NodeMetadata{ProxyConfig: (*model.NodeMetaProxyConfig)(config)}})
+		builder := NewClusterBuilder(proxy, &model.PushRequest{Push: cg.PushContext()}, model.DisabledCache{})
+		return buildClusterKey(service, port, builder, proxy, nil).Key()
+	}
+	legacy, selected := key(""), key("/var/run/secrets/istio/trust-domains/spiffe-bundle-map.json")
+	if legacy == selected {
+		t.Fatal("native CDS cache can reuse an unselected TLS context for a mapped proxy")
+	}
+	if selected != key("/another/selected/map.json") {
+		t.Fatal("runtime map paths created independent configuration/cache authority")
 	}
 }

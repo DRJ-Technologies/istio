@@ -21,19 +21,25 @@ import (
 	"crypto/rand"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/json"
 	"encoding/pem"
 	"math/big"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
 	core "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
 	tls "github.com/envoyproxy/go-control-plane/envoy/extensions/transport_sockets/tls/v3"
 	discovery "github.com/envoyproxy/go-control-plane/envoy/service/discovery/v3"
+	"github.com/spiffe/go-spiffe/v2/bundle/spiffebundle"
+	"github.com/spiffe/go-spiffe/v2/spiffeid"
 	"google.golang.org/protobuf/proto"
 
 	"istio.io/istio/pilot/test/xdstest"
 	"istio.io/istio/pkg/security"
 	"istio.io/istio/pkg/testcerts"
+	"istio.io/istio/security/pkg/nodeagent/cache"
 )
 
 func typedDomainStore(t *testing.T, secret *tls.Secret) *tls.SPIFFECertValidatorConfig {
@@ -92,7 +98,7 @@ func TestDomainBundleSDSNativeCRLInputAndSelectedAnchorIsolation(t *testing.T) {
 		return pem.EncodeToMemory(&pem.Block{Type: "X509 CRL", Bytes: der})
 	}
 	current := crl(now.Add(-time.Minute), now.Add(time.Hour))
-	parsed, err := parseBundleCRLs(current, now)
+	parsed, err := security.ParseWorkloadCRLs(current, now)
 	if err != nil || len(parsed) != 1 {
 		t.Fatalf("current public CRL was not parsed: %v", err)
 	}
@@ -242,4 +248,106 @@ func TestDomainBundleSDSReferencedROOTCAUpdateDenyAndRecovery(t *testing.T) {
 	verify(root.ExpectResponse(t), true)
 	reconnected := s.Connect()
 	verify(reconnected.RequestResponseAck(t, &discovery.DiscoveryRequest{ResourceNames: []string{security.RootCertReqResourceName}}), true)
+}
+
+func TestDomainBundleSDSRealProjectionReaderRemovalAndRecovery(t *testing.T) {
+	block, _ := pem.Decode(testcerts.CACert)
+	anchor, err := x509.ParseCertificate(block.Bytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bundle, err := spiffebundle.FromX509Authorities(spiffeid.RequireTrustDomainFromString("foreign.example"), []*x509.Certificate{anchor}).Marshal()
+	if err != nil {
+		t.Fatal(err)
+	}
+	granting, err := json.Marshal(map[string]any{"trust_domains": map[string]json.RawMessage{"foreign.example": bundle}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(t.TempDir(), "projection", "spiffe-bundle-map.json")
+	if err := os.Mkdir(filepath.Dir(path), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	write := func(data []byte) {
+		t.Helper()
+		if err := os.WriteFile(path, data, 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write(granting)
+	options := &security.Options{TrustDomain: "local.example", SPIFFEBundleMapPath: path, FileMountedCerts: true}
+	reader, err := cache.NewSecretManagerClient(nil, options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(reader.Close)
+	// Reuse the native SDS test server/UDS interface with the actual file reader,
+	// rather than DirectSecretManager.UpdateSecret. No arbitrary secret removal.
+	t.Chdir(t.TempDir())
+	server := NewServer(options, reader, nil)
+	t.Cleanup(server.Stop)
+	reader.RegisterSecretHandler(server.OnSecretUpdate)
+	client := (&TestServer{t: t, server: server, udsPath: security.GetIstioSDSServerSocketPath()}).Connect()
+	verify := func(response *discovery.DiscoveryResponse, deny bool) bool {
+		t.Helper()
+		if len(response.Resources) != 1 {
+			t.Fatal("referenced ROOTCA was withdrawn instead of updated")
+		}
+		secret := xdstest.ExtractTLSSecrets(t, response.Resources)[security.RootCertReqResourceName]
+		store := typedDomainStore(t, secret)
+		if deny {
+			if len(store.TrustDomains) != 1 || store.TrustDomains[0].Name != "local.example" ||
+				len(store.TrustDomains[0].TrustBundle.GetInlineBytes()) != 0 {
+				return false
+			}
+			assertEmptyLocalStore(t, secret)
+			return true
+		}
+		if len(store.TrustDomains) != 1 || store.TrustDomains[0].Name != "foreign.example" ||
+			!bytes.Equal(store.TrustDomains[0].TrustBundle.GetInlineBytes(), testcerts.CACert) {
+			return false
+		}
+		return true
+	}
+	response := client.RequestResponseAck(t, &discovery.DiscoveryRequest{ResourceNames: []string{security.RootCertReqResourceName}})
+	if !verify(response, false) {
+		t.Fatal("wrong initial native projection authority")
+	}
+	for _, data := range [][]byte{[]byte(`{"trust_domains":{}}`), granting, []byte(`{"trust_domains":{"foreign.example":{},"foreign\u002eexample":{}}}`)} {
+		write(data)
+		// A second reader can observe the new state before native event dispatch.
+		// The already-referenced first stream must still receive an actual update.
+		if _, err := reader.GenerateSecret(security.RootCertReqResourceName); err != nil {
+			t.Fatal(err)
+		}
+		deadline := time.Now().Add(5 * time.Second)
+		for {
+			response = client.ExpectResponse(t)
+			current := verify(response, !bytes.Equal(data, granting))
+			client.Request(t, &discovery.DiscoveryRequest{ResourceNames: []string{security.RootCertReqResourceName},
+				ResponseNonce: response.Nonce, VersionInfo: response.VersionInfo})
+			if current {
+				break
+			}
+			if time.Now().After(deadline) {
+				t.Fatal("referenced stream did not converge on current authority")
+			}
+		}
+	}
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		response = client.ExpectResponse(t)
+		current := verify(response, true)
+		client.Request(t, &discovery.DiscoveryRequest{ResourceNames: []string{security.RootCertReqResourceName},
+			ResponseNonce: response.Nonce, VersionInfo: response.VersionInfo})
+		if current {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("native deletion did not update referenced ROOTCA")
+		}
+	}
 }

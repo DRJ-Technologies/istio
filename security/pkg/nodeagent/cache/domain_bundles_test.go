@@ -17,10 +17,15 @@ package cache
 import (
 	"bytes"
 	"crypto"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
 	"crypto/x509"
+	"crypto/x509/pkix"
 	"encoding/json"
 	"encoding/pem"
 	"fmt"
+	"math/big"
 	"os"
 	"path/filepath"
 	"testing"
@@ -337,4 +342,242 @@ func TestDomainBundleProjectionRemovalErrorRecoveryAndRestart(t *testing.T) {
 		t.Fatal(err)
 	}
 	assertStore(sc, "")
+}
+
+func TestDomainBundleSynchronousReadPublishesRemovalBeforeWatchDispatch(t *testing.T) {
+	directory := t.TempDir()
+	path := filepath.Join(directory, "spiffe-bundle-map.json")
+	write := func(data []byte) {
+		t.Helper()
+		if err := os.WriteFile(path, data, 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write(domainBundleProjection(t, "foreign.example"))
+	watcher, err := fsnotify.NewWatcher()
+	if err != nil {
+		t.Fatal(err)
+	}
+	sc := &SecretManagerClient{certWatcher: watcher, stop: make(chan struct{}), fileCerts: make(map[FileCert]struct{}),
+		configOptions: &security.Options{SPIFFEBundleMapPath: path, TrustDomain: "local.example"},
+		domainBundles: &workloadDomainBundles{directory: directory}}
+	t.Cleanup(sc.Close)
+	// Deliberately do not dispatch watcher events. Consume the initial granting
+	// snapshot before the existing subscriber registers its notification hook.
+	if len(sc.domainBundleSecret().TrustDomainBundles) != 1 {
+		t.Fatal("missing initial authority")
+	}
+	updates := make(chan struct{}, 8)
+	sc.RegisterSecretHandler(func(name string) {
+		if name == security.RootCertReqResourceName {
+			updates <- struct{}{}
+		}
+	})
+	write([]byte(`{"trust_domains":{}}`))
+	if len(sc.domainBundleSecret().TrustDomainBundles) != 0 {
+		t.Fatal("new read retained authority")
+	}
+	select {
+	case <-updates:
+	default:
+		t.Fatal("synchronous reader consumed removal without notifying existing subscriber")
+	}
+	// Publication must also survive the queued native event after that read.
+	if !sc.domainBundleFileEvent(fsnotify.Event{Name: path, Op: fsnotify.Write}) {
+		t.Fatal("read-before-event suppressed ROOTCA publication")
+	}
+}
+
+func domainBundleTestCRL(t *testing.T, nextUpdate time.Time) []byte {
+	t.Helper()
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now()
+	template := &x509.Certificate{SerialNumber: big.NewInt(1), Subject: pkix.Name{CommonName: "workload-CRL-issuer"},
+		SubjectKeyId: []byte{1}, NotBefore: now.Add(-time.Hour), NotAfter: now.Add(time.Hour), IsCA: true,
+		BasicConstraintsValid: true, KeyUsage: x509.KeyUsageCertSign | x509.KeyUsageCRLSign}
+	der, err := x509.CreateCertificate(rand.Reader, template, template, &key.PublicKey, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	issuer, err := x509.ParseCertificate(der)
+	if err != nil {
+		t.Fatal(err)
+	}
+	der, err = x509.CreateRevocationList(rand.Reader, &x509.RevocationList{Number: big.NewInt(1),
+		ThisUpdate: now.Add(-time.Minute), NextUpdate: nextUpdate}, issuer, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return pem.EncodeToMemory(&pem.Block{Type: "X509 CRL", Bytes: der})
+}
+
+func TestDomainBundleNativeCRLExpiryPublishesWithoutFileEvent(t *testing.T) {
+	for _, replace := range []bool{false, true} {
+		t.Run(fmt.Sprintf("replace=%v", replace), func(t *testing.T) {
+			directory := t.TempDir()
+			path, crlPath := filepath.Join(directory, "spiffe-bundle-map.json"), filepath.Join(directory, "ca-crl.pem")
+			if err := os.WriteFile(path, domainBundleProjection(t, "foreign.example"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			deadline := time.Now().Truncate(time.Second).Add(2 * time.Second)
+			original := domainBundleTestCRL(t, deadline)
+			if err := os.WriteFile(crlPath, original, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			watcher, err := fsnotify.NewWatcher()
+			if err != nil {
+				t.Fatal(err)
+			}
+			sc := &SecretManagerClient{certWatcher: watcher, stop: make(chan struct{}), fileCerts: make(map[FileCert]struct{}),
+				queue: queue.NewDelayed(), configOptions: &security.Options{SPIFFEBundleMapPath: path, TrustDomain: "local.example"},
+				domainBundles: &workloadDomainBundles{directory: directory, crlPath: crlPath}}
+			t.Cleanup(sc.Close)
+			// Only the native rotation queue runs: there are no filesystem callbacks
+			// and no new SDS reads after the accepted snapshot until the assertion.
+			go sc.queue.Run(sc.stop)
+			if !bytes.Equal(sc.domainBundleSecret().WorkloadCRL, original) {
+				t.Fatal("missing accepted CRL")
+			}
+			updates := make(chan struct{}, 8)
+			sc.RegisterSecretHandler(func(name string) {
+				if name == security.RootCertReqResourceName {
+					updates <- struct{}{}
+				}
+			})
+			if replace {
+				replacement := domainBundleTestCRL(t, deadline.Add(10*time.Second))
+				if err := os.WriteFile(crlPath, replacement, 0o600); err != nil {
+					t.Fatal(err)
+				}
+				// The old task must read the new input, publish it and leave it valid;
+				// bytes in memory intentionally still represent the original generation.
+				select {
+				case <-updates:
+				case <-time.After(5 * time.Second):
+					t.Fatal("native deadline did not inspect replacement")
+				}
+				item := sc.domainBundleSecret()
+				if !bytes.Equal(item.WorkloadCRL, replacement) {
+					t.Fatal("old timer revoked a replacement CRL")
+				}
+				if _, err := security.ParseWorkloadCRLs(item.WorkloadCRL, time.Now()); err != nil {
+					t.Fatalf("replacement not current: %v", err)
+				}
+			} else {
+				select {
+				case <-updates:
+				case <-time.After(5 * time.Second):
+					t.Fatal("CRL expiry did not publish ROOTCA without a file event")
+				}
+				if _, err := security.ParseWorkloadCRLs(sc.domainBundleSecret().WorkloadCRL, time.Now()); err == nil {
+					t.Fatal("expired CRL still grants authority in the current SDS input")
+				}
+			}
+		})
+	}
+}
+
+func TestDomainBundleNativeMountedFallbackRotationRemovalAndMappedLatch(t *testing.T) {
+	parent := t.TempDir()
+	native := filepath.Join(parent, "native-certs")
+	if err := os.Mkdir(native, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	options := &security.Options{SPIFFEBundleMapPath: filepath.Join(parent, "map", "spiffe-bundle-map.json"),
+		TrustDomain: "local.example", WorkloadNamespace: "own", ServiceAccount: "own", FileMountedCerts: true,
+		RootCertFilePath: filepath.Join(native, "root.pem"), CertChainFilePath: filepath.Join(native, "chain.pem"), KeyFilePath: filepath.Join(native, "key.pem")}
+	write := func(path string, data []byte) {
+		t.Helper()
+		if err := os.WriteFile(path, data, 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	install := func() []byte {
+		t.Helper()
+		roots, issuer, key := workloadDomainTestCA(t)
+		chain, leafKey, err := pkiutil.GenCertKeyFromOptions(pkiutil.CertOptions{
+			Host: "spiffe://local.example/ns/own/sa/own", TTL: time.Hour, SignerCert: issuer, SignerPriv: key,
+			IsClient: true, IsServer: true, ECSigAlg: pkiutil.EcdsaSigAlg})
+		if err != nil {
+			t.Fatal(err)
+		}
+		write(options.RootCertFilePath, roots)
+		write(options.CertChainFilePath, chain)
+		write(options.KeyFilePath, leafKey)
+		return roots
+	}
+	initial := install()
+	sc, err := NewSecretManagerClient(nil, options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(sc.Close)
+	item, err := sc.GenerateSecret(security.RootCertReqResourceName)
+	if err != nil || !bytes.Equal(item.TrustDomainBundles[options.TrustDomain], initial) {
+		t.Fatalf("invalid native fallback: %v", err)
+	}
+	updates := make(chan struct{}, 64)
+	sc.RegisterSecretHandler(func(name string) {
+		if name == security.RootCertReqResourceName {
+			select {
+			case updates <- struct{}{}:
+			default:
+			}
+		}
+	})
+	observed := func(want []byte, mapped bool) {
+		t.Helper()
+		timer := time.NewTimer(5 * time.Second)
+		defer timer.Stop()
+		for {
+			select {
+			case <-updates:
+				item, err := sc.GenerateSecret(security.RootCertReqResourceName)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if mapped {
+					if len(item.TrustDomainBundles) == 1 && len(item.TrustDomainBundles["foreign.example"]) != 0 {
+						return
+					}
+				} else if bytes.Equal(item.TrustDomainBundles[options.TrustDomain], want) && (len(want) != 0 || len(item.TrustDomainBundles) == 0) {
+					return
+				}
+			case <-timer.C:
+				t.Fatal("mounted qualification input changed without ROOTCA notification/convergence")
+			}
+		}
+	}
+	replacement := install()
+	observed(replacement, false)
+	if err := os.Remove(options.RootCertFilePath); err != nil {
+		t.Fatal(err)
+	}
+	observed(nil, false)
+	write(options.RootCertFilePath, replacement)
+	observed(replacement, false)
+	if err := os.Remove(options.CertChainFilePath); err != nil {
+		t.Fatal(err)
+	}
+	observed(nil, false)
+	restored := install()
+	observed(restored, false)
+	if err := os.Mkdir(filepath.Dir(options.SPIFFEBundleMapPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	write(options.SPIFFEBundleMapPath, domainBundleProjection(t, "foreign.example"))
+	observed(nil, true)
+	if err := os.Remove(options.SPIFFEBundleMapPath); err != nil {
+		t.Fatal(err)
+	}
+	// Replacing fallback inputs after mapped removal cannot reinstate local roots.
+	install()
+	observed(nil, false)
+	item, err = sc.GenerateSecret(security.RootCertReqResourceName)
+	if err != nil || len(item.TrustDomainBundles) != 0 {
+		t.Fatalf("mapped removal restored fallback: %v", err)
+	}
 }

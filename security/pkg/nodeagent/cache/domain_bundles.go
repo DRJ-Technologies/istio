@@ -24,6 +24,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/fsnotify/fsnotify"
 	"github.com/spiffe/go-spiffe/v2/spiffeid"
@@ -42,6 +43,7 @@ type workloadDomainBundles struct {
 	directory   string
 	crlPath     string
 	crl         []byte
+	crlExpiry   time.Time
 }
 
 func cloneDomainRoots(roots map[string][]byte) map[string][]byte {
@@ -127,11 +129,26 @@ func (sc *SecretManagerClient) refreshDomainBundles() bool {
 // Both projections use the existing watcher descriptor. Watch a parent as
 // well, so a removed directory can recover and an initially missing optional
 // mount can appear. No directories/files are created by the trust consumer.
-func (sc *SecretManagerClient) watchDomainBundleDirectories() error {
+func (sc *SecretManagerClient) domainBundleDirectories() []string {
 	directories := []string{sc.domainBundles.directory}
 	if sc.domainBundles.crlPath != "" {
 		directories = append(directories, filepath.Dir(sc.domainBundles.crlPath))
 	}
+	if sc.configOptions.FileMountedCerts {
+		// ROOTCA fallback depends on both the mounted own SVID and its native
+		// workload anchors. Reuse directory watches even for missing inputs,
+		// so atomic replacement/removal and later appearance are observed.
+		for _, path := range []string{sc.existingCertificateFile.CertificatePath, sc.existingCertificateFile.CaCertificatePath} {
+			if path != "" {
+				directories = append(directories, filepath.Dir(path))
+			}
+		}
+	}
+	return directories
+}
+
+func (sc *SecretManagerClient) watchDomainBundleDirectories() error {
+	directories := sc.domainBundleDirectories()
 	for _, directory := range directories {
 		for _, candidate := range []string{filepath.Dir(directory), directory} {
 			for {
@@ -180,7 +197,51 @@ func (sc *SecretManagerClient) refreshWorkloadCRLLocked() bool {
 	}
 	changed := (b.crl == nil) != (data == nil) || !bytes.Equal(b.crl, data)
 	b.crl = bytes.Clone(data)
+	if changed {
+		sc.scheduleWorkloadCRLExpiryLocked()
+	}
 	return changed
+}
+
+func (sc *SecretManagerClient) scheduleWorkloadCRLExpiryLocked() {
+	b := sc.domainBundles
+	b.crlExpiry = time.Time{}
+	crls, err := security.ParseWorkloadCRLs(b.crl, time.Now())
+	if err != nil || sc.queue == nil {
+		return
+	}
+	deadline := crls[0].NextUpdate
+	for _, crl := range crls[1:] {
+		if crl.NextUpdate.Before(deadline) {
+			deadline = crl.NextUpdate
+		}
+	}
+	b.crlExpiry = deadline
+	input := bytes.Clone(b.crl)
+	// The existing certificate-rotation queue shares the native stop lifecycle.
+	// The task reads the current input before checking its captured generation;
+	// a replacement CRL cannot be revoked by an older validity deadline.
+	sc.queue.PushDelayed(func() error {
+		sc.refreshAndNotifyDomainBundles()
+		b.mu.Lock()
+		current := b.crlExpiry.Equal(deadline) && bytes.Equal(b.crl, input)
+		if current {
+			b.crlExpiry = time.Time{}
+		}
+		b.mu.Unlock()
+		if current {
+			sc.OnSecretUpdate(security.RootCertReqResourceName)
+		}
+		return nil
+	}, max(time.Until(deadline), 0))
+}
+
+func (sc *SecretManagerClient) refreshAndNotifyDomainBundles() {
+	if sc.refreshDomainBundles() {
+		// Notify outside the snapshot lock. A synchronous SDS read must not
+		// consume a change that an existing subscriber still needs to receive.
+		sc.OnSecretUpdate(security.RootCertReqResourceName)
+	}
 }
 
 func (sc *SecretManagerClient) domainBundleFileEvent(event fsnotify.Event) bool {
@@ -192,23 +253,31 @@ func (sc *SecretManagerClient) domainBundleFileEvent(event fsnotify.Event) bool 
 		return event.Name == directory || filepath.Dir(event.Name) == directory ||
 			strings.HasPrefix(directory, event.Name+string(filepath.Separator))
 	}
-	if !affects(b.directory) && (b.crlPath == "" || !affects(filepath.Dir(b.crlPath))) {
+	relevant := false
+	for _, directory := range sc.domainBundleDirectories() {
+		relevant = relevant || affects(directory)
+	}
+	if !relevant {
 		return false
 	}
 	// Recover only through a working watch of the same projection directory.
 	if err := sc.watchDomainBundleDirectories(); err != nil {
-		return sc.denyDomainBundles()
+		sc.denyDomainBundles()
+		return true
 	}
 	b.mu.Lock()
 	b.watchFailed = false
 	b.mu.Unlock()
-	return sc.refreshDomainBundles()
+	sc.refreshDomainBundles()
+	// A synchronous reader may already have observed this event's contents.
+	// That does not remove the obligation to update existing ROOTCA subscribers.
+	return true
 }
 
 func (sc *SecretManagerClient) domainBundleSecret() *security.SecretItem {
 	// Read now as well as on events. A caller cannot receive old roots merely
 	// because the native watcher has not dispatched an already-visible update.
-	sc.refreshDomainBundles()
+	sc.refreshAndNotifyDomainBundles()
 	b := sc.domainBundles
 	b.mu.Lock()
 	mapped, roots, crl := b.mapped, cloneDomainRoots(b.roots), bytes.Clone(b.crl)
@@ -233,7 +302,7 @@ func (sc *SecretManagerClient) domainBundleSecret() *security.SecretItem {
 		}
 		// Signing/read may have waited while the authoritative map arrived.
 		// Recheck under the same lock; fallback can never override mapped removal.
-		sc.refreshDomainBundles()
+		sc.refreshAndNotifyDomainBundles()
 		b.mu.Lock()
 		if b.mapped {
 			roots = cloneDomainRoots(b.roots)

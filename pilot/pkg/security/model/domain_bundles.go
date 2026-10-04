@@ -95,6 +95,10 @@ func ApplyMappedRootContext(proxy *model.Proxy, context *tls.CommonTlsContext, c
 		denyMappedPeerIdentity(validation)
 	}
 	validation.Crl = nil
+	// The denying URI constraint enforces refusal. Do not leave unsupported
+	// pin material to be decoded into an invalid/NACKed configuration.
+	validation.VerifyCertificateHash = nil
+	validation.VerifyCertificateSpki = nil
 }
 
 // Resumption would skip validation against the current domain snapshot. These

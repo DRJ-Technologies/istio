@@ -15,7 +15,10 @@
 package security
 
 import (
+	"bytes"
 	"context"
+	"crypto/x509"
+	"encoding/pem"
 	"fmt"
 	"net/http"
 	"os"
@@ -599,4 +602,41 @@ func SdsCertificateConfigFromResourceNameForOSCACert(resource string) (SdsCertif
 		return SdsCertificateConfig{}, false
 	}
 	return SdsCertificateConfig{"", "", resource}, true
+}
+
+// ParseWorkloadCRLs validates the single native public CRL input for both
+// its SDS store and the cache validity-transition scheduler. CRLs grant no
+// anchors; issuer/signature/chain coverage remains with the selected verifier.
+func ParseWorkloadCRLs(data []byte, now time.Time) ([]*x509.RevocationList, error) {
+	var crls []*x509.RevocationList
+	for rest := bytes.TrimSpace(data); len(rest) != 0; {
+		if !bytes.HasPrefix(rest, []byte("-----BEGIN X509 CRL-----")) {
+			return nil, fmt.Errorf("unexpected workload CRL material")
+		}
+		end := bytes.Index(rest, []byte("-----END X509 CRL-----"))
+		if end < 0 {
+			return nil, fmt.Errorf("unterminated workload CRL")
+		}
+		end += len("-----END X509 CRL-----")
+		if bytes.Count(rest[:end], []byte("-----BEGIN")) != 1 {
+			return nil, fmt.Errorf("skipped workload CRL block")
+		}
+		block, tail := pem.Decode(rest[:end])
+		if block == nil || block.Type != "X509 CRL" || len(block.Headers) != 0 || len(bytes.TrimSpace(tail)) != 0 {
+			return nil, fmt.Errorf("invalid workload CRL PEM")
+		}
+		crl, err := x509.ParseRevocationList(block.Bytes)
+		if err != nil {
+			return nil, err
+		}
+		if crl.ThisUpdate.After(now) || crl.NextUpdate.IsZero() || !crl.NextUpdate.After(now) {
+			return nil, fmt.Errorf("workload CRL is not current")
+		}
+		crls = append(crls, crl)
+		rest = bytes.TrimSpace(rest[end:])
+	}
+	if len(crls) == 0 {
+		return nil, fmt.Errorf("empty workload CRL")
+	}
+	return crls, nil
 }
