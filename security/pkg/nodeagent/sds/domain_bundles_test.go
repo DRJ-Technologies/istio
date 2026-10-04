@@ -259,6 +259,7 @@ func TestDomainBundleSDSRealProjectionReaderRemovalAndRecovery(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	canonicalAnchor := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: anchor.Raw})
 	bundle, err := spiffebundle.FromX509Authorities(spiffeid.RequireTrustDomainFromString("foreign.example"), []*x509.Certificate{anchor}).Marshal()
 	if err != nil {
 		t.Fatal(err)
@@ -307,7 +308,7 @@ func TestDomainBundleSDSRealProjectionReaderRemovalAndRecovery(t *testing.T) {
 			return true
 		}
 		if len(store.TrustDomains) != 1 || store.TrustDomains[0].Name != "foreign.example" ||
-			!bytes.Equal(store.TrustDomains[0].TrustBundle.GetInlineBytes(), testcerts.CACert) {
+			!bytes.Equal(store.TrustDomains[0].TrustBundle.GetInlineBytes(), canonicalAnchor) {
 			return false
 		}
 		return true
