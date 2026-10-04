@@ -209,10 +209,7 @@ func (s *Server) updateRootCertAndGenKeyCert() error {
 		// Publish native workload CA roots to the per-domain namespace projection.
 		// DNS/control-plane endpoint roots do not grant workload authority.
 		log.Infof("Update trust anchor with new root cert")
-		err := s.workloadTrustBundle.UpdateTrustAnchor(&tb.TrustAnchorUpdate{
-			TrustAnchorConfig: tb.TrustAnchorConfig{Certs: []string{string(caBundle)}},
-			Source:            tb.SourceIstioCA,
-		})
+		err := s.workloadTrustBundle.UpdateTrustAnchor(nativeWorkloadRootUpdate(tb.SourceIstioCA, caBundle))
 		if err != nil {
 			log.Errorf("failed to update trust anchor from source Istio CA, err: %v", err)
 			return err

@@ -208,6 +208,9 @@ func meshDomainTrustAnchors(cfg *meshconfig.MeshConfig) (string, map[string][]*x
 		if entry == nil || entry.GetPem() == "" {
 			return local, nil, fmt.Errorf("domain-bound caCertificates require PEM; bundle endpoints and signer declarations are unsupported")
 		}
+		if len(entry.GetCertSigners()) != 0 {
+			return local, nil, fmt.Errorf("signer-scoped caCertificates cannot authorize workload trust domains")
+		}
 		certs, err := parseDomainTrustAnchors([]string{entry.GetPem()})
 		if err != nil {
 			return local, nil, err

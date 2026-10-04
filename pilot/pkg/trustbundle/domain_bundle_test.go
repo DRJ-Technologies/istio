@@ -303,6 +303,13 @@ func TestDomainBundleRejectsInvalidCompleteConfiguration(t *testing.T) {
 	for i, input := range pemInputs {
 		cases[fmt.Sprintf("PEM %d", i)] = &meshconfig.MeshConfig{TrustDomain: "local.example", CaCertificates: []*meshconfig.MeshConfig_CertificateData{domainPEM(input)}}
 	}
+	for _, domains := range [][]string{nil, {"foreign.example"}} {
+		entry := domainPEM(good.pem, domains...)
+		entry.CertSigners = []string{"example.com/istiod"}
+		cases[fmt.Sprintf("signer with domains %v", domains)] = &meshconfig.MeshConfig{
+			TrustDomain: "local.example", CaCertificates: []*meshconfig.MeshConfig_CertificateData{entry},
+		}
+	}
 	for _, domain := range []string{"", "*", "Local.example", "spiffe://foreign.example", "foreign.example/", "foreign.example:443"} {
 		cases["local domain "+domain] = &meshconfig.MeshConfig{TrustDomain: domain}
 		cases["bound domain "+domain] = &meshconfig.MeshConfig{TrustDomain: "local.example", CaCertificates: []*meshconfig.MeshConfig_CertificateData{domainPEM(good.pem, domain)}}
