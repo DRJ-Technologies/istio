@@ -50,6 +50,25 @@ ISTIO_ENVOY_RELEASE_URL="${ISTIO_ENVOY_RELEASE_URL:-${ISTIO_ENVOY_BASE_URL}/envo
 ISTIO_ENVOY_LINUX_VERSION="${ISTIO_ENVOY_LINUX_VERSION:-${ISTIO_ENVOY_VERSION}}"
 ISTIO_ENVOY_LINUX_DEBUG_URL="${ISTIO_ENVOY_LINUX_DEBUG_URL:-${ISTIO_ENVOY_DEBUG_URL}}"
 ISTIO_ENVOY_LINUX_RELEASE_URL="${ISTIO_ENVOY_LINUX_RELEASE_URL:-${ISTIO_ENVOY_RELEASE_URL}}"
+# Explicit paths select already-qualified local artifacts, never a download cache.
+# Check them before the defaults erase the distinction (including empty inputs).
+explicit_release_path=false
+explicit_debug_path=false
+check_explicit_envoy_path() {
+  if [[ -z "$1" || ! -f "$1" || ! -r "$1" || ! -x "$1" ]]; then
+    echo "Explicit $2 must be a readable executable regular file" >&2
+    exit 1
+  fi
+}
+if [[ ${ISTIO_ENVOY_LINUX_RELEASE_PATH+x} ]]; then
+  check_explicit_envoy_path "$ISTIO_ENVOY_LINUX_RELEASE_PATH" ISTIO_ENVOY_LINUX_RELEASE_PATH
+  explicit_release_path=true
+fi
+if [[ -n "${DEBUG_IMAGE:-}" && ${ISTIO_ENVOY_LINUX_DEBUG_PATH+x} ]]; then
+  check_explicit_envoy_path "$ISTIO_ENVOY_LINUX_DEBUG_PATH" ISTIO_ENVOY_LINUX_DEBUG_PATH
+  explicit_debug_path=true
+fi
+
 # Variables for the extracted debug/release Envoy artifacts.
 ISTIO_ENVOY_LINUX_DEBUG_DIR="${ISTIO_ENVOY_LINUX_DEBUG_DIR:-${TARGET_OUT_LINUX}/debug}"
 ISTIO_ENVOY_LINUX_DEBUG_NAME="${ISTIO_ENVOY_LINUX_DEBUG_NAME:-envoy-debug-${ISTIO_ENVOY_LINUX_VERSION}}"
@@ -134,28 +153,53 @@ function download_envoy_if_necessary () {
   fi
 }
 
+# Populate the existing per-architecture image input even if it contains a
+# previous artifact. Docker's native plan consumes release/envoy or debug/envoy,
+# rather than an arbitrary explicitly selected source path.
+copy_explicit_envoy() {
+  mkdir -p "$2"
+  if [[ ! "$1" -ef "$2/${SIDECAR}" ]]; then
+    cp -f "$1" "$2/${SIDECAR}"
+    chmod +x "$2/${SIDECAR}"
+  fi
+}
+
 mkdir -p "${TARGET_OUT}"
 
-# Set the value of DOWNLOAD_COMMAND (either curl or wget)
-set_download_command
+# Explicit local inputs require no downloader or credential setup.
+if [[ "$explicit_release_path" == false || ( -n "${DEBUG_IMAGE:-}" && "$explicit_debug_path" == false ) ]]; then
+  set_download_command
+fi
 
 if [[ -n "${DEBUG_IMAGE:-}" ]]; then
   # Download and extract the Envoy linux debug binary.
-  download_envoy_if_necessary "${ISTIO_ENVOY_LINUX_DEBUG_URL}" "$ISTIO_ENVOY_LINUX_DEBUG_PATH" "${SIDECAR}"
+  if [[ "$explicit_debug_path" == false ]]; then
+    download_envoy_if_necessary "${ISTIO_ENVOY_LINUX_DEBUG_URL}" "$ISTIO_ENVOY_LINUX_DEBUG_PATH" "${SIDECAR}"
+  else
+    copy_explicit_envoy "$ISTIO_ENVOY_LINUX_DEBUG_PATH" "$ISTIO_ENVOY_LINUX_DEBUG_DIR"
+  fi
 else
   echo "Skipping envoy debug. Set DEBUG_IMAGE to download."
 fi
 
 # Download and extract the Envoy linux release binary.
-download_envoy_if_necessary "${ISTIO_ENVOY_LINUX_RELEASE_URL}" "$ISTIO_ENVOY_LINUX_RELEASE_PATH" "${SIDECAR}"
+if [[ "$explicit_release_path" == false ]]; then
+  download_envoy_if_necessary "${ISTIO_ENVOY_LINUX_RELEASE_URL}" "$ISTIO_ENVOY_LINUX_RELEASE_PATH" "${SIDECAR}"
+else
+  copy_explicit_envoy "$ISTIO_ENVOY_LINUX_RELEASE_PATH" "$ISTIO_ENVOY_LINUX_RELEASE_DIR"
+fi
 ISTIO_ENVOY_NATIVE_PATH=${ISTIO_ENVOY_LINUX_RELEASE_PATH}
 
 # Copy native envoy binary to TARGET_OUT
 echo "Copying ${ISTIO_ENVOY_NATIVE_PATH} to ${TARGET_OUT}/${SIDECAR}"
-cp -f "${ISTIO_ENVOY_NATIVE_PATH}" "${TARGET_OUT}/${SIDECAR}"
+if [[ "$explicit_release_path" == false || ! "$ISTIO_ENVOY_NATIVE_PATH" -ef "${TARGET_OUT}/${SIDECAR}" ]]; then
+  cp -f "${ISTIO_ENVOY_NATIVE_PATH}" "${TARGET_OUT}/${SIDECAR}"
+fi
 
 # Copy the envoy binary to TARGET_OUT_LINUX if the local OS is not Linux
 if [[ "$GOOS_LOCAL" != "linux" ]]; then
    echo "Copying ${ISTIO_ENVOY_LINUX_RELEASE_PATH} to ${TARGET_OUT_LINUX}/${SIDECAR}"
-  cp -f "${ISTIO_ENVOY_LINUX_RELEASE_PATH}" "${TARGET_OUT_LINUX}/${SIDECAR}"
+  if [[ "$explicit_release_path" == false || ! "$ISTIO_ENVOY_LINUX_RELEASE_PATH" -ef "${TARGET_OUT_LINUX}/${SIDECAR}" ]]; then
+    cp -f "${ISTIO_ENVOY_LINUX_RELEASE_PATH}" "${TARGET_OUT_LINUX}/${SIDECAR}"
+  fi
 fi
