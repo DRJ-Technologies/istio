@@ -1,6 +1,6 @@
 name: Native OCI build
 
-on:
+'on':
   workflow_dispatch:
     inputs:
       artifact_tag:
