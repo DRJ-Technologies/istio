@@ -26,8 +26,8 @@ import (
 	"google.golang.org/protobuf/types/known/wrapperspb"
 
 	networking "istio.io/api/networking/v1alpha3"
-	"istio.io/istio/pilot/pkg/credentials"
 	"istio.io/istio/pilot/pkg/model"
+	"istio.io/istio/pilot/pkg/model/credentials"
 	istionetworking "istio.io/istio/pilot/pkg/networking"
 	authnutils "istio.io/istio/pilot/pkg/security/authn/utils"
 	secmodel "istio.io/istio/pilot/pkg/security/model"
