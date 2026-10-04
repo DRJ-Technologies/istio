@@ -164,6 +164,17 @@ init: $(TARGET_OUT)/istio_is_init init-ztunnel-rs
 # seems to be about obtaining a new version of the 3rd party libraries).
 # Transient network/proxy errors worth retrying on go module + tool fetches.
 GO_FETCH_RETRY ?= SSL_ERROR_SYSCALL|TLS handshake timeout|i/o timeout|connection reset|unexpected EOF|503 Service Unavailable|reset by peer|tls: bad record MAC
+# Reconsume explicitly selected local artifacts even if an earlier init stamp
+# exists. A stale stamp must not hide a missing or newly selected source input.
+ifneq ($(origin ISTIO_ENVOY_LINUX_RELEASE_PATH),undefined)
+.PHONY: $(TARGET_OUT)/istio_is_init
+endif
+ifneq ($(origin DEBUG_IMAGE),undefined)
+ifneq ($(origin ISTIO_ENVOY_LINUX_DEBUG_PATH),undefined)
+.PHONY: $(TARGET_OUT)/istio_is_init
+endif
+endif
+
 $(TARGET_OUT)/istio_is_init: bin/init.sh istio.deps | $(TARGET_OUT)
 	@# Add a retry, as occasionally we see transient connection failures to GCS
 	@# Like `curl: (56) OpenSSL SSL_read: SSL_ERROR_SYSCALL, errno 104`
