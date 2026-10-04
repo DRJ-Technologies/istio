@@ -207,8 +207,10 @@ func BuildListenerTLSContext(serverTLSSettings *networking.ServerTLSSettings,
 		// This native branch does not otherwise carry the original pin inputs
 		// into CVC. Preserve them until mapped-policy refusal can observe them.
 		validation := ctx.CommonTlsContext.GetCombinedValidationContext().GetDefaultValidationContext()
-		validation.VerifyCertificateSpki = serverTLSSettings.VerifyCertificateSpki
-		validation.VerifyCertificateHash = serverTLSSettings.VerifyCertificateHash
+		if validation != nil {
+			validation.VerifyCertificateSpki = serverTLSSettings.VerifyCertificateSpki
+			validation.VerifyCertificateHash = serverTLSSettings.VerifyCertificateHash
+		}
 	}
 	authnmodel.ApplyMappedRootContext(proxy, ctx.CommonTlsContext, serverTLSSettings.CaCrl)
 	authnmodel.DisableMappedDownstreamResumption(proxy, ctx)

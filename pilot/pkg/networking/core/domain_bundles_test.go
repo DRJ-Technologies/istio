@@ -22,6 +22,7 @@ import (
 	cluster "github.com/envoyproxy/go-control-plane/envoy/config/cluster/v3"
 	tls "github.com/envoyproxy/go-control-plane/envoy/extensions/transport_sockets/tls/v3"
 	matcher "github.com/envoyproxy/go-control-plane/envoy/type/matcher/v3"
+	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/wrapperspb"
 
 	networking "istio.io/api/networking/v1alpha3"
@@ -178,7 +179,8 @@ func TestDomainBundleNativeCDSCacheSeparatesSelectedContexts(t *testing.T) {
 		config.ProxyMetadata = map[string]string{security.SPIFFEBundleMapPathEnv: path}
 		proxy := cg.SetupProxy(&model.Proxy{Metadata: &model.NodeMetadata{ProxyConfig: (*model.NodeMetaProxyConfig)(config)}})
 		builder := NewClusterBuilder(proxy, &model.PushRequest{Push: cg.PushContext()}, model.DisabledCache{})
-		return buildClusterKey(service, port, builder, proxy, nil).Key()
+		entry := buildClusterKey(service, port, builder, proxy, nil)
+		return entry.Key()
 	}
 	legacy, selected := key(""), key("/var/run/secrets/istio/trust-domains/spiffe-bundle-map.json")
 	if legacy == selected {
@@ -186,5 +188,37 @@ func TestDomainBundleNativeCDSCacheSeparatesSelectedContexts(t *testing.T) {
 	}
 	if selected != key("/another/selected/map.json") {
 		t.Fatal("runtime map paths created independent configuration/cache authority")
+	}
+}
+
+func TestDomainBundleNativeQUICWithoutPeerValidationPreservesTLSContract(t *testing.T) {
+	proxy := &model.Proxy{Type: model.Router, Metadata: &model.NodeMetadata{}}
+	config := mesh.DefaultProxyConfig()
+	proxy.Metadata.ProxyConfig = (*model.NodeMetaProxyConfig)(config)
+	push := model.NewPushContext()
+	push.Mesh = mesh.DefaultMeshConfig()
+	settings := &networking.ServerTLSSettings{Mode: networking.ServerTLSSettings_ISTIO_MUTUAL}
+	baseline := BuildListenerTLSContext(settings, proxy, push, istionetworking.TransportProtocolQUIC, false)
+	config.ProxyMetadata = map[string]string{security.SPIFFEBundleMapPathEnv: "/var/run/secrets/istio/trust-domains/spiffe-bundle-map.json"}
+	selected := BuildListenerTLSContext(settings, proxy, push, istionetworking.TransportProtocolQUIC, false)
+	if err := selected.ValidateAll(); err != nil {
+		t.Fatalf("native QUIC TLS context was invalidated: %v", err)
+	}
+	if !proto.Equal(baseline, selected) {
+		t.Fatal("map selection changed the native QUIC TLS contract")
+	}
+	if len(selected.CommonTlsContext.TlsCertificateSdsSecretConfigs) != 1 ||
+		selected.CommonTlsContext.TlsCertificateSdsSecretConfigs[0].Name != secmodel.SDSDefaultResourceName {
+		t.Fatal("native QUIC server lost its workload certificate")
+	}
+	// Upstream QUIC client-certificate authentication is still unsupported.
+	// Absence of CVC is not mapped peer authorization or integration proof.
+	if selected.CommonTlsContext.GetCombinedValidationContext() != nil || selected.RequireClientCertificate.GetValue() {
+		t.Fatal("consumer invented unsupported QUIC peer authentication")
+	}
+	tcp := BuildListenerTLSContext(settings, proxy, push, istionetworking.TransportProtocolTCP, true)
+	if !tcp.RequireClientCertificate.GetValue() ||
+		tcp.CommonTlsContext.GetCombinedValidationContext().GetValidationContextSdsSecretConfig().GetName() != secmodel.SDSRootResourceName {
+		t.Fatal("native TCP mapped mutual TLS was loosened by the QUIC guard")
 	}
 }

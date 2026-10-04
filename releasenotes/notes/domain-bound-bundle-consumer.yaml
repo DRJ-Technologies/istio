@@ -9,11 +9,13 @@ releaseNotes:
     Initial optional absence permits only own-SVID-qualified local anchors. After
     mapped activation, empty, removed, malformed or unreadable data produces an
     explicit zero-anchor SDS update rather than withdrawing a referenced secret.
-    Native templates project the read-only directory without subPath. Mesh contexts
-    retain exact URI endpoint constraints and disable session resumption; external
+    Native templates project the read-only directory without subPath. Mesh ROOTCA
+    contexts retain exact URI endpoint constraints and disable session resumption; external
     file/credential and control-plane TLS retain their separate native inputs.
     The existing public CRL projection is included in selected stores for native
     chain revocation checking. Its removal after presence denies mapped trust;
     unsupported per-server CRL or certificate-pin constraints refuse mapped peers.
     Missing selected-chain CRL coverage and existing-connection revocation require
     the paired native Envoy/proxy qualification; this source does not clear runtime.
+    Native QUIC client-certificate authentication remains unsupported and unchanged;
+    map selection does not establish QUIC mutual TLS or mapped peer authorization.
