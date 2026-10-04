@@ -16,19 +16,27 @@ package controller
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"os"
+	"path/filepath"
+	"sort"
+	"strings"
 	"testing"
 	"time"
 
 	v1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes/fake"
+	ktesting "k8s.io/client-go/testing"
 
 	meshconfig "istio.io/api/mesh/v1alpha1"
 	"istio.io/istio/pilot/pkg/features"
 	"istio.io/istio/pilot/pkg/server"
+	"istio.io/istio/pilot/pkg/trustbundle"
 	"istio.io/istio/pkg/cluster"
 	"istio.io/istio/pkg/config/constants"
 	"istio.io/istio/pkg/config/mesh/meshwatcher"
@@ -37,6 +45,7 @@ import (
 	"istio.io/istio/pkg/kube/kclient"
 	filter "istio.io/istio/pkg/kube/namespace"
 	"istio.io/istio/pkg/test"
+	"istio.io/istio/pkg/test/env"
 	"istio.io/istio/pkg/test/util/assert"
 	"istio.io/istio/pkg/test/util/retry"
 )
@@ -54,7 +63,7 @@ func TestTrustDomainsController(t *testing.T) {
 	})
 	stop := test.NewStop(t)
 	kube.SetObjectFilter(client, filter.NewDiscoveryNamespacesFilter(kclient.New[*v1.Namespace](client), meshWatcher, stop))
-	c := NewTrustDomainsController(client, meshWatcher)
+	c := NewTrustDomainsController(client, meshWatcher, nil)
 	client.RunAndWait(stop)
 	go c.Run(stop)
 	retry.UntilOrFail(t, c.queue.HasSynced)
@@ -110,7 +119,7 @@ func TestTrustDomainsControllerWatchNamespace(t *testing.T) {
 	t.Cleanup(client.Shutdown)
 	watcher := meshwatcher.NewTestWatcher(&meshconfig.MeshConfig{TrustDomain: "local.example"})
 	stop := make(chan struct{})
-	c := NewTrustDomainsController(client, watcher)
+	c := NewTrustDomainsController(client, watcher, nil)
 	client.RunAndWait(stop)
 	done := make(chan struct{})
 	go func() {
@@ -240,4 +249,110 @@ func expectTrustDomainsConfigMap(t *testing.T, client kube.Client, ns, want stri
 		}
 		return nil
 	}, retry.Timeout(10*time.Second))
+}
+
+func TestDomainBundleControllerAtomicProjectionAndScope(t *testing.T) {
+	test.SetForTest(t, &features.InformerWatchNamespace, "owned")
+	// The new projection cannot widen authority even if the legacy name flag is set.
+	test.SetForTest(t, &features.SkipValidateTrustDomain, true)
+	outside := &v1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: TrustDomainsNamespaceConfigMap, Namespace: "outside"}, Data: trustDomainsCM("other-owner.example\n")}
+	client := kube.NewFakeClient(&v1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "owned"}}, &v1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "outside"}}, outside)
+	t.Cleanup(client.Shutdown)
+	root, err := os.ReadFile(filepath.Join(env.IstioSrc, "samples/certs/root-cert.pem"))
+	assert.NoError(t, err)
+	cfg := &meshconfig.MeshConfig{TrustDomain: "local.example", CaCertificates: []*meshconfig.MeshConfig_CertificateData{{
+		CertificateData: &meshconfig.MeshConfig_CertificateData_Pem{Pem: string(root)}, TrustDomains: []string{"foreign.example"},
+	}}}
+	watcher := meshwatcher.NewTestWatcher(cfg)
+	tb := trustbundle.NewTrustBundle(nil, watcher)
+	assert.NoError(t, tb.AddMeshConfigUpdate(cfg))
+	assert.NoError(t, tb.UpdateTrustAnchor(&trustbundle.TrustAnchorUpdate{Source: trustbundle.SourceIstioCA, TrustAnchorConfig: trustbundle.TrustAnchorConfig{Certs: []string{string(root)}}}))
+	reg := watcher.AddMeshHandler(func() { _ = tb.AddMeshConfigUpdate(watcher.Mesh()) })
+	t.Cleanup(func() { watcher.DeleteMeshHandler(reg) })
+	fakeClient := client.Kube().(*fake.Clientset)
+	// Every emitted API mutation must carry a self-consistent pair. The API
+	// reactor observes writes, not merely the eventual informer cache contents.
+	verifyWrite := func(cm *v1.ConfigMap) {
+		if cm.Namespace != "owned" {
+			t.Errorf("attempted out-of-scope write to %s", cm.Namespace)
+		}
+		var doc struct {
+			TrustDomains map[string]json.RawMessage `json:"trust_domains"`
+		}
+		if err := json.Unmarshal([]byte(cm.Data[constants.SPIFFEBundleMapConfigMapDataName]), &doc); err != nil {
+			t.Errorf("invalid emitted bundle: %v", err)
+			return
+		}
+		if doc.TrustDomains == nil {
+			t.Error("missing authoritative map")
+		}
+		var names []string
+		for name := range doc.TrustDomains {
+			names = append(names, name)
+		}
+		want := ""
+		if len(names) > 0 {
+			sort.Strings(names)
+			want = strings.Join(names, "\n") + "\n"
+		}
+		if cm.Data[constants.TrustDomainsNamespaceConfigMapDataName] != want {
+			t.Errorf("torn bundle/names update: %+v", cm.Data)
+		}
+	}
+	fakeClient.PrependReactor("create", "configmaps", func(a ktesting.Action) (bool, runtime.Object, error) {
+		verifyWrite(a.(ktesting.CreateAction).GetObject().(*v1.ConfigMap))
+		return false, nil, nil
+	})
+	fakeClient.PrependReactor("update", "configmaps", func(a ktesting.Action) (bool, runtime.Object, error) {
+		verifyWrite(a.(ktesting.UpdateAction).GetObject().(*v1.ConfigMap))
+		return false, nil, nil
+	})
+	stop := make(chan struct{})
+	c := NewTrustDomainsController(client, watcher, tb)
+	client.RunAndWait(stop)
+	done := make(chan struct{})
+	go func() { c.Run(stop); close(done) }()
+	shutdown := func() {
+		select {
+		case <-stop:
+		default:
+			close(stop)
+		}
+		select {
+		case <-done:
+		case <-time.After(5 * time.Second):
+			t.Fatal("controller did not stop")
+		}
+		<-c.queue.Closed()
+	}
+	t.Cleanup(shutdown)
+	expected := func() map[string]string {
+		snapshot := tb.GetDomainBundle()
+		names := ""
+		if len(snapshot.TrustDomains()) > 0 {
+			names = strings.Join(snapshot.TrustDomains(), "\n") + "\n"
+		}
+		return map[string]string{constants.SPIFFEBundleMapConfigMapDataName: string(snapshot.BundleMap()), constants.TrustDomainsNamespaceConfigMapDataName: names}
+	}
+	expectConfigMap(t, c.configmaps, TrustDomainsNamespaceConfigMap, "owned", expected())
+	// Native CA rotation/removal notifies without a MeshConfig change.
+	assert.NoError(t, tb.UpdateTrustAnchor(&trustbundle.TrustAnchorUpdate{Source: trustbundle.SourceIstioCA}))
+	expectConfigMap(t, c.configmaps, TrustDomainsNamespaceConfigMap, "owned", expected())
+	// Explicit foreign removal and malformed update revoke without a restart.
+	watcher.Set(&meshconfig.MeshConfig{TrustDomain: "local.example"})
+	expectConfigMap(t, c.configmaps, TrustDomainsNamespaceConfigMap, "owned", expected())
+	watcher.Set(cfg)
+	expectConfigMap(t, c.configmaps, TrustDomainsNamespaceConfigMap, "owned", expected())
+	watcher.Set(&meshconfig.MeshConfig{TrustDomain: "local.example", CaCertificates: []*meshconfig.MeshConfig_CertificateData{{CertificateData: &meshconfig.MeshConfig_CertificateData_Pem{Pem: string(root) + "bad trailing block"}, TrustDomains: []string{"foreign.example"}}}})
+	expectConfigMap(t, c.configmaps, TrustDomainsNamespaceConfigMap, "owned", expected())
+	// The central reconcile guard must also reject direct scheduling.
+	assert.NoError(t, c.reconcile(types.NamespacedName{Namespace: "outside"}))
+	shutdown()
+	got, err := client.Kube().CoreV1().ConfigMaps("outside").Get(context.Background(), TrustDomainsNamespaceConfigMap, metav1.GetOptions{})
+	assert.NoError(t, err)
+	assert.Equal(t, got.Data, outside.Data)
+	// No listener survives the controller lifetime.
+	before := len(fakeClient.Actions())
+	assert.NoError(t, tb.AddMeshConfigUpdate(cfg))
+	assert.Equal(t, len(fakeClient.Actions()), before)
 }

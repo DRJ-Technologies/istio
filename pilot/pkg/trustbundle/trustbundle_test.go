@@ -15,10 +15,7 @@
 package trustbundle
 
 import (
-	"crypto/x509"
 	"fmt"
-	"net/http"
-	"net/http/httptest"
 	"os"
 	"path"
 	"sort"
@@ -28,7 +25,6 @@ import (
 	meshconfig "istio.io/api/mesh/v1alpha1"
 	"istio.io/istio/pkg/config/mesh/meshwatcher"
 	"istio.io/istio/pkg/slices"
-	"istio.io/istio/pkg/test"
 	"istio.io/istio/pkg/test/env"
 	"istio.io/istio/pkg/test/util/retry"
 )
@@ -269,69 +265,30 @@ func expectTbCount(t *testing.T, tb *TrustBundle, expAnchorCount int, ti time.Du
 }
 
 func TestAddMeshConfigUpdate(t *testing.T) {
-	caCertPool, err := x509.SystemCertPool()
-	if err != nil {
-		t.Fatalf("failed to get SystemCertPool: %v", err)
+	tb := NewTrustBundle(nil, meshwatcher.NewTestWatcher(&meshconfig.MeshConfig{TrustDomain: "cluster.local"}))
+	cfg := &meshconfig.MeshConfig{TrustDomain: "cluster.local", CaCertificates: []*meshconfig.MeshConfig_CertificateData{
+		{CertificateData: &meshconfig.MeshConfig_CertificateData_Pem{Pem: rootCACert}},
+	}}
+	if err := tb.AddMeshConfigUpdate(cfg); err != nil {
+		t.Fatal(err)
 	}
-	stop := test.NewStop(t)
-
-	// Mock response from TLS Spiffe Server
-	validHandler := http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte(validSpiffeX509Bundle))
+	expectTbCount(t, tb, 1, time.Second, "local PEM authority")
+	cfg.CaCertificates = append(cfg.CaCertificates, &meshconfig.MeshConfig_CertificateData{
+		CertificateData: &meshconfig.MeshConfig_CertificateData_SpiffeBundleUrl{SpiffeBundleUrl: "https://bundle.example"},
+		TrustDomains:    []string{"foreign.example"},
 	})
-
-	server1 := httptest.NewTLSServer(validHandler)
-	caCertPool.AddCert(server1.Certificate())
-	defer server1.Close()
-
-	server2 := httptest.NewTLSServer(validHandler)
-	caCertPool.AddCert(server2.Certificate())
-	defer server2.Close()
-
-	tb := NewTrustBundle(caCertPool, meshwatcher.NewTestWatcher(&meshconfig.MeshConfig{TrustDomain: "cluster.local"}))
-
-	// Change global remote timeout interval for the duration of the unit test
-	remoteTimeout = 30 * time.Millisecond
-
-	// Test1: Ensure that MeshConfig PEM certs are updated correctly
-	tb.AddMeshConfigUpdate(&meshconfig.MeshConfig{CaCertificates: []*meshconfig.MeshConfig_CertificateData{
-		{CertificateData: &meshconfig.MeshConfig_CertificateData_Pem{Pem: rootCACert}},
-	}})
-	expectTbCount(t, tb, 1, 1*time.Second, "meshConfig pem trustAnchor not updated in bundle")
-
-	// Test2: Append server1 as spiffe endpoint to existing MeshConfig
-
-	// Start processing remote anchor update with poll frequency.
-	go tb.ProcessRemoteTrustAnchors(stop, 200*time.Millisecond)
-	tb.AddMeshConfigUpdate(&meshconfig.MeshConfig{CaCertificates: []*meshconfig.MeshConfig_CertificateData{
-		{CertificateData: &meshconfig.MeshConfig_CertificateData_SpiffeBundleUrl{SpiffeBundleUrl: server1.Listener.Addr().String()}},
-		{CertificateData: &meshconfig.MeshConfig_CertificateData_Pem{Pem: rootCACert}},
-	}})
-	if !slices.Equal(tb.endpoints, []string{server1.Listener.Addr().String()}) {
-		t.Errorf("server1 endpoint not correctly updated in trustbundle. Trustbundle endpoints: %v", tb.endpoints)
+	if err := tb.AddMeshConfigUpdate(cfg); err == nil {
+		t.Fatal("endpoint declaration was silently flattened")
 	}
-	// Check server1's anchor has been added along with meshConfig pem cert
-	expectTbCount(t, tb, 2, 3*time.Second, "server1(running) trustAnchor not updated in bundle")
-
-	// Test3: Stop server1
-	server1.Close()
-	// Check server1's valid trustAnchor is no longer in the trustbundle within poll frequency window
-	expectTbCount(t, tb, 1, 6*time.Second, "server1(stopped) trustAnchor not removed from bundle")
-
-	// Test4: Update with server1, server2 and mesh pem ca
-	tb.AddMeshConfigUpdate(&meshconfig.MeshConfig{CaCertificates: []*meshconfig.MeshConfig_CertificateData{
-		{CertificateData: &meshconfig.MeshConfig_CertificateData_SpiffeBundleUrl{SpiffeBundleUrl: server2.Listener.Addr().String()}},
-		{CertificateData: &meshconfig.MeshConfig_CertificateData_SpiffeBundleUrl{SpiffeBundleUrl: server1.Listener.Addr().String()}},
-		{CertificateData: &meshconfig.MeshConfig_CertificateData_Pem{Pem: rootCACert}},
-	}})
-	if !slices.Equal(tb.endpoints, []string{server2.Listener.Addr().String(), server1.Listener.Addr().String()}) {
-		t.Errorf("server2 endpoint not correctly updated in trustbundle. Trustbundle endpoints: %v", tb.endpoints)
+	if len(tb.endpoints) != 0 {
+		t.Fatal("unsupported endpoint was scheduled")
 	}
-	// Check only server 2's trustanchor is present along with meshConfig pem and not server 1 (since it is down)
-	expectTbCount(t, tb, 2, 3*time.Second, "server2(running) trustAnchor not updated in bundle")
-
-	// Test5. remove everything
-	tb.AddMeshConfigUpdate(&meshconfig.MeshConfig{CaCertificates: []*meshconfig.MeshConfig_CertificateData{}})
-	expectTbCount(t, tb, 0, 3*time.Second, "trustAnchor not updated in bundle after meshConfig cleared")
+	if string(tb.GetDomainBundle().BundleMap()) != `{"trust_domains":{}}` {
+		t.Fatal("invalid update retained mapped authority")
+	}
+	cfg.CaCertificates = nil
+	if err := tb.AddMeshConfigUpdate(cfg); err != nil {
+		t.Fatal(err)
+	}
+	expectTbCount(t, tb, 0, time.Second, "local authority removed")
 }

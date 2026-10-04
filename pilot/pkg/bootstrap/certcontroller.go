@@ -205,22 +205,21 @@ func (s *Server) RotateDNSCertForK8sCA(stop <-chan struct{},
 func (s *Server) updateRootCertAndGenKeyCert() error {
 	log.Infof("update root cert and generate new dns certs")
 	caBundle := s.CA.GetCAKeyCertBundle().GetRootCertPem()
-	certChain, keyPEM, err := s.CA.GenKeyCert(s.dnsNames, SelfSignedCACertTTL.Get(), false)
-	if err != nil {
-		return err
-	}
-
-	if features.MultiRootMesh {
-		// Trigger trust anchor update, this will send PCDS to all sidecars.
+	if s.workloadTrustBundle != nil {
+		// Publish native workload CA roots to the per-domain namespace projection.
+		// DNS/control-plane endpoint roots do not grant workload authority.
 		log.Infof("Update trust anchor with new root cert")
-		err = s.workloadTrustBundle.UpdateTrustAnchor(&tb.TrustAnchorUpdate{
-			TrustAnchorConfig: tb.TrustAnchorConfig{Certs: []string{string(caBundle)}},
-			Source:            tb.SourceIstioCA,
-		})
+		err := s.workloadTrustBundle.UpdateTrustAnchor(nativeWorkloadRootUpdate(tb.SourceIstioCA, caBundle))
 		if err != nil {
 			log.Errorf("failed to update trust anchor from source Istio CA, err: %v", err)
 			return err
 		}
+	}
+	// Workload authority must not retain an old root if unrelated DNS certificate
+	// generation fails after the native CA has already updated its bundle.
+	certChain, keyPEM, err := s.CA.GenKeyCert(s.dnsNames, SelfSignedCACertTTL.Get(), false)
+	if err != nil {
+		return err
 	}
 
 	s.istiodCertBundleWatcher.SetAndNotify(keyPEM, certChain, caBundle)

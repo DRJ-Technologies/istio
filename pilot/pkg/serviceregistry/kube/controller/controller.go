@@ -37,6 +37,7 @@ import (
 	"istio.io/istio/pilot/pkg/serviceregistry/provider"
 	labelutil "istio.io/istio/pilot/pkg/serviceregistry/util/label"
 	"istio.io/istio/pilot/pkg/serviceregistry/util/workloadinstances"
+	"istio.io/istio/pilot/pkg/trustbundle"
 	"istio.io/istio/pkg/activenotifier"
 	"istio.io/istio/pkg/cluster"
 	"istio.io/istio/pkg/config"
@@ -142,6 +143,10 @@ type Options struct {
 
 	// MeshWatcher observes changes to the mesh config
 	MeshWatcher meshwatcher.WatcherCollection
+
+	// WorkloadTrustBundle is owned by the local config cluster. Remote optional
+	// MeshConfig discovery must not grant foreign-root authority to this bundle.
+	WorkloadTrustBundle *trustbundle.TrustBundle
 
 	// ConfigClusterMeshWatcher is the mesh watcher from the config (local) cluster.
 	// Used as a fallback when the per-cluster MeshWatcher cannot read the remote meshconfig.

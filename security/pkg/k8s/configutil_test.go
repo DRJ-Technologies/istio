@@ -32,6 +32,7 @@ import (
 	"istio.io/istio/pkg/kube"
 	"istio.io/istio/pkg/kube/kclient"
 	"istio.io/istio/pkg/test"
+	"istio.io/istio/pkg/test/util/assert"
 )
 
 const (
@@ -399,6 +400,50 @@ func Test_insertData(t *testing.T) {
 			if !reflect.DeepEqual(tt.args.cm.Data, tt.expectedCM.Data) {
 				t.Errorf("configmap data: %v, want %v", tt.args.cm.Data, tt.expectedCM)
 			}
+		})
+	}
+}
+
+func TestInsertMapToConfigMapAtomicAndEmptyKeys(t *testing.T) {
+	for _, existing := range []map[string]string{nil, {"unrelated": "preserved"}} {
+		t.Run(fmt.Sprint(existing), func(t *testing.T) {
+			var objects []runtime.Object
+			if existing != nil {
+				objects = append(objects, createConfigMap(namespaceName, configMapName, existing))
+			}
+			client := kube.NewFakeClient(objects...)
+			t.Cleanup(client.Shutdown)
+			configmaps := kclient.New[*v1.ConfigMap](client)
+			client.RunAndWait(test.NewStop(t))
+			fakeClient := client.Kube().(*fake.Clientset)
+			fakeClient.ClearActions()
+			data := map[string]string{"trust-domains": "", "spiffe-bundle-map.json": `{"trust_domains":{}}`}
+			assert.NoError(t, InsertMapToConfigMap(configmaps, metav1.ObjectMeta{Name: configMapName, Namespace: namespaceName}, data))
+			actions := fakeClient.Actions()
+			if len(actions) != 1 {
+				t.Fatalf("expected one atomic mutation, got %v", actions)
+			}
+			var cm *v1.ConfigMap
+			if existing == nil {
+				cm = actions[0].(ktesting.CreateAction).GetObject().(*v1.ConfigMap)
+			} else {
+				cm = actions[0].(ktesting.UpdateAction).GetObject().(*v1.ConfigMap)
+			}
+			if value, ok := cm.Data["trust-domains"]; !ok || value != "" {
+				t.Fatal("empty compatibility key omitted")
+			}
+			if cm.Data["spiffe-bundle-map.json"] != data["spiffe-bundle-map.json"] {
+				t.Fatal("map key missing")
+			}
+			if existing != nil && cm.Data["unrelated"] != "preserved" {
+				t.Fatal("unrelated data lost")
+			}
+			// No-op comparison includes key presence and must not alias caller data.
+			fakeClient.ClearActions()
+			assert.NoError(t, updateMapInConfigMap(configmaps, cm, data))
+			assert.Equal(t, len(fakeClient.Actions()), 0)
+			data["trust-domains"] = "caller-mutated"
+			assert.Equal(t, cm.Data["trust-domains"], "")
 		})
 	}
 }

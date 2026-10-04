@@ -305,11 +305,10 @@ func NewServer(args *PilotArgs, initFuncs ...func(*Server)) (*Server, error) {
 		return nil, err
 	}
 
-	if features.MultiRootMesh {
-		// Initialize trust bundle after mesh config which it depends on
-		s.workloadTrustBundle = tb.NewTrustBundle(nil, e.Watcher)
-		e.TrustBundle = s.workloadTrustBundle
-	}
+	// The per-domain namespace projection is independent of PCDS/MultiRootMesh.
+	// Authority comes from local MeshConfig and the native workload CA/RA only.
+	s.workloadTrustBundle = tb.NewTrustBundle(nil, e.Watcher)
+	e.TrustBundle = s.workloadTrustBundle
 
 	// Options based on the current 'defaults' in istio.
 	caOpts := &caOptions{
@@ -1339,11 +1338,7 @@ func (s *Server) addIstioCAToTrustBundle(args *PilotArgs) error {
 	var err error
 	if s.CA != nil {
 		// If IstioCA is setup, derive trustAnchor directly from CA
-		rootCerts := []string{string(s.CA.GetCAKeyCertBundle().GetRootCertPem())}
-		err = s.workloadTrustBundle.UpdateTrustAnchor(&tb.TrustAnchorUpdate{
-			TrustAnchorConfig: tb.TrustAnchorConfig{Certs: rootCerts},
-			Source:            tb.SourceIstioCA,
-		})
+		err = s.workloadTrustBundle.UpdateTrustAnchor(nativeWorkloadRootUpdate(tb.SourceIstioCA, s.CA.GetCAKeyCertBundle().GetRootCertPem()))
 		if err != nil {
 			log.Errorf("unable to add CA root from namespace %s as trustAnchor", args.Namespace)
 			return err
@@ -1353,14 +1348,21 @@ func (s *Server) addIstioCAToTrustBundle(args *PilotArgs) error {
 	return nil
 }
 
-func (s *Server) initWorkloadTrustBundle(args *PilotArgs) error {
-	var err error
-
-	if !features.MultiRootMesh {
-		return nil
+// Absence removes this native source; nonempty malformed PEM remains an invalid
+// update. Use the same adapter for initialization and root rotation.
+func nativeWorkloadRootUpdate(source tb.Source, root []byte) *tb.TrustAnchorUpdate {
+	var certs []string
+	if len(root) != 0 {
+		certs = []string{string(root)}
 	}
+	return &tb.TrustAnchorUpdate{Source: source, TrustAnchorConfig: tb.TrustAnchorConfig{Certs: certs}}
+}
 
+func (s *Server) initWorkloadTrustBundle(args *PilotArgs) error {
 	s.workloadTrustBundle.UpdateCb(func() {
+		if !features.MultiRootMesh {
+			return
+		}
 		pushReq := &model.PushRequest{
 			Reason: model.NewReasonStats(model.GlobalUpdate),
 			Forced: true,
@@ -1368,38 +1370,28 @@ func (s *Server) initWorkloadTrustBundle(args *PilotArgs) error {
 		s.XDSServer.ConfigUpdate(pushReq)
 	})
 
-	s.addStartFunc("remote trust anchors", func(stop <-chan struct{}) error {
-		go s.workloadTrustBundle.ProcessRemoteTrustAnchors(stop, tb.RemoteDefaultPollPeriod)
-		return nil
-	})
-
-	// MeshConfig: Add initial roots
-	err = s.workloadTrustBundle.AddMeshConfigUpdate(s.environment.Mesh())
-	if err != nil {
-		return err
-	}
-
-	// MeshConfig:Add callback for mesh config update
+	// Register recovery before validating the initial input. Invalid authority
+	// must not prevent the namespace controller from replacing persisted bundles
+	// with the empty snapshot on restart.
 	s.environment.AddMeshHandler(func() {
-		_ = s.workloadTrustBundle.AddMeshConfigUpdate(s.environment.Mesh())
+		if err := s.workloadTrustBundle.AddMeshConfigUpdate(s.environment.Mesh()); err != nil {
+			log.Errorf("invalid domain trust bundle; all projected authority revoked: %v", err)
+		}
 	})
 
-	err = s.addIstioCAToTrustBundle(args)
-	if err != nil {
-		return err
+	if err := s.workloadTrustBundle.AddMeshConfigUpdate(s.environment.Mesh()); err != nil {
+		log.Errorf("invalid initial domain trust bundle; projected authority is empty: %v", err)
+	}
+	if err := s.addIstioCAToTrustBundle(args); err != nil {
+		log.Errorf("invalid initial native CA root; projected authority is empty: %v", err)
 	}
 
 	// IstioRA: Explicitly add roots corresponding to RA
 	if s.RA != nil {
 		// Implicitly add the Istio RA certificates to the Workload Trust Bundle
-		rootCerts := []string{string(s.RA.GetCAKeyCertBundle().GetRootCertPem())}
-		err = s.workloadTrustBundle.UpdateTrustAnchor(&tb.TrustAnchorUpdate{
-			TrustAnchorConfig: tb.TrustAnchorConfig{Certs: rootCerts},
-			Source:            tb.SourceIstioRA,
-		})
+		err := s.workloadTrustBundle.UpdateTrustAnchor(nativeWorkloadRootUpdate(tb.SourceIstioRA, s.RA.GetCAKeyCertBundle().GetRootCertPem()))
 		if err != nil {
-			log.Errorf("fatal: unable to add RA root as trustAnchor")
-			return err
+			log.Errorf("invalid initial native RA root; projected authority is empty: %v", err)
 		}
 	}
 	log.Infof("done initializing workload trustBundle")

@@ -306,7 +306,7 @@ func (m *Multicluster) initializeCluster(cluster *multicluster.Cluster, kubeCont
 					NewLeaderElectionMulticluster(options.SystemNamespace, m.serverID, leaderelection.TrustDomainsController, m.revision, !configCluster, client).
 					AddRunFunction(func(leaderStop <-chan struct{}) {
 						log.Infof("starting trust domains controller for cluster %s", cluster.ID)
-						c := NewTrustDomainsController(client, m.opts.MeshWatcher)
+						c := NewTrustDomainsController(client, m.opts.MeshWatcher, m.opts.WorkloadTrustBundle)
 						// As for the namespace controller, informers are started with the cluster stop, not the
 						// leader election stop, since they are created lazily once we hold the lock.
 						client.RunAndWait(clusterStopCh)

@@ -99,6 +99,10 @@ const (
 	// peers are accepted from, one per line.
 	TrustDomainsNamespaceConfigMapDataName = "trust-domains"
 
+	// SPIFFEBundleMapConfigMapDataName is the standard authoritative per-domain
+	// X509-SVID bundle map, projected beside the compatibility trust-domain names.
+	SPIFFEBundleMapConfigMapDataName = "spiffe-bundle-map.json"
+
 	// PodInfoLabelsPath is the filepath that pod labels will be stored
 	// This is typically set by the downward API
 	PodInfoLabelsPath = "./etc/istio/pod/labels"
