@@ -23,3 +23,69 @@ jobs:
           git diff --check
       - name: Test native base references and companion selection
         run: go test ./tools/docker-builder/...
+
+  domain-bundle-consumers:
+    runs-on: ubuntu-latest
+    env:
+      GOENV: "off"
+      GOWORK: "off"
+      GOTOOLCHAIN: local
+      TEST_FILTER: ^(TestDomainBundle.*|TestBuildListenerTLSContext|TestBuildUpstreamClusterTLSContext)$
+      TEST_PACKAGES: >-
+        ./security/pkg/nodeagent/sds
+        ./pkg/istio-agent
+        ./pilot/pkg/security/model
+        ./pilot/pkg/networking/core
+        ./pkg/kube/inject
+        ./pilot/pkg/config/kube/gatewaycommon
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff
+        with:
+          go-version-file: go.mod
+      - name: Inventory native matched consumer groups
+        shell: bash
+        run: |
+          go version
+          read -r -a packages <<< "$TEST_PACKAGES"
+          go test -mod=readonly -p=1 -race -list "$TEST_FILTER" "${packages[@]}" \
+            | tee "$RUNNER_TEMP/domain-consumer-matches.txt"
+      - name: Run native consumer race tests
+        shell: bash
+        run: |
+          read -r -a packages <<< "$TEST_PACKAGES"
+          go test -mod=readonly -p=1 -race -json -run "$TEST_FILTER" "${packages[@]}" \
+            | tee "$RUNNER_TEMP/domain-consumer-tests.jsonl"
+      - name: Require actual matched groups and package passes
+        if: always()
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import json, os, re
+          from pathlib import Path
+          root = Path(os.environ["RUNNER_TEMP"])
+          expected, pending = {}, set()
+          for line in (root / "domain-consumer-matches.txt").read_text().splitlines():
+              if re.fullmatch(r"Test\w+", line):
+                  pending.add(line)
+              elif line.split()[:1] == ["ok"]:
+                  expected[line.split()[1]], pending = pending, set()
+          assert len(expected) == len(os.environ["TEST_PACKAGES"].split()) and all(expected.values()), "missing native matched groups"
+          run, passed, packages, failures = {}, {}, set(), []
+          for line in (root / "domain-consumer-tests.jsonl").read_text().splitlines():
+              event = json.loads(line)
+              action, package, test = event.get("Action"), event.get("Package"), event.get("Test")
+              if action in ("fail", "build-fail", "skip"):
+                  failures.append(event)
+              if test and "/" not in test and action in ("run", "pass"):
+                  target = run if action == "run" else passed
+                  target.setdefault(package, set()).add(test)
+              if action == "pass" and not test:
+                  packages.add(package)
+          for package, names in expected.items():
+              print(package, "expected:", sorted(names), "ran:", sorted(run.get(package, set())), "passed:", sorted(passed.get(package, set())))
+              assert run.get(package, set()) == names and passed.get(package, set()) == names and package in packages, "unqualified consumer group/package"
+          assert not failures, failures
+          PY

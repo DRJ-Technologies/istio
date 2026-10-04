@@ -133,6 +133,15 @@ func (cb *ClusterBuilder) buildUpstreamClusterTLSContext(opts *buildClusterOpts,
 		}
 	}
 
+	// ClusterBuilder retains the actual proxy metadata, rather than a Proxy.
+	// These mapped-context helpers use only that native metadata selector.
+	proxy := &model.Proxy{Metadata: cb.proxyMetadata}
+	if sec_model.UsesWorkloadDomainBundles(proxy) && tls.CredentialName == credentials.BuiltinGatewaySecretTypeURI {
+		// The built-in credential resolves to mapped ROOTCA. InsecureSkipVerify
+		// must not remove that reference and bypass the selected-domain store.
+		tls = tls.DeepCopy()
+		tls.InsecureSkipVerify = nil
+	}
 	c := opts.mutable
 	var tlsContext *tlsv3.UpstreamTlsContext
 	var err error
@@ -153,6 +162,10 @@ func (cb *ClusterBuilder) buildUpstreamClusterTLSContext(opts *buildClusterOpts,
 				DefaultValidationContext:         &tlsv3.CertificateValidationContext{MatchSubjectAltNames: util.StringToExactMatch(tls.SubjectAltNames)},
 				ValidationContextSdsSecretConfig: sec_model.ConstructSdsSecretConfig(sec_model.SDSRootResourceName),
 			},
+		}
+		if sec_model.UsesWorkloadDomainBundles(proxy) {
+			sec_model.ApplyMappedPeerIdentity(tlsContext.CommonTlsContext.GetCombinedValidationContext().DefaultValidationContext,
+				tls.SubjectAltNames)
 		}
 		// Set default SNI of cluster name for istio_mutual if sni is not set and if not a DFP cluster.
 		if len(tlsContext.Sni) == 0 && !c.isDFPCluster {
@@ -191,6 +204,8 @@ func (cb *ClusterBuilder) buildUpstreamClusterTLSContext(opts *buildClusterOpts,
 	}
 	// Compliance for Envoy TLS upstreams.
 	if tlsContext != nil {
+		sec_model.ApplyMappedRootContext(proxy, tlsContext.CommonTlsContext, tls.CaCrl)
+		sec_model.DisableMappedUpstreamResumption(proxy, tlsContext)
 		sec_model.EnforceCompliance(tlsContext.CommonTlsContext)
 	}
 	return tlsContext, nil

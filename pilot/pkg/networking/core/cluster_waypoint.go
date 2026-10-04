@@ -492,6 +492,16 @@ func (cb *ClusterBuilder) buildConnectOriginate(
 ) *cluster.Cluster {
 	ctx := buildCommonConnectTLSContext(proxy, push)
 	validationCtx := ctx.GetCombinedValidationContext().DefaultValidationContext
+	if sec_model.UsesWorkloadDomainBundles(proxy) {
+		for _, uriSanMatcher := range uriSanMatchers {
+			if uriSanMatcher != nil {
+				// Expected endpoint principals replace any broader constraints;
+				// appending would OR them with a broad domain-prefix allowance.
+				validationCtx.MatchTypedSubjectAltNames = nil
+				break
+			}
+		}
+	}
 	for _, uriSanMatcher := range uriSanMatchers {
 		if uriSanMatcher != nil {
 			validationCtx.MatchTypedSubjectAltNames = append(validationCtx.MatchTypedSubjectAltNames, &tlsv3.SubjectAltNameMatcher{
@@ -502,6 +512,8 @@ func (cb *ClusterBuilder) buildConnectOriginate(
 	}
 	// Compliance for Envoy tunnel upstreams.
 	sec_model.EnforceCompliance(ctx)
+	tlsContext := &tlsv3.UpstreamTlsContext{CommonTlsContext: ctx}
+	sec_model.DisableMappedUpstreamResumption(proxy, tlsContext)
 	c := &cluster.Cluster{
 		Name:                          name,
 		ClusterDiscoveryType:          &cluster.Cluster_Type{Type: cluster.Cluster_ORIGINAL_DST},
@@ -527,10 +539,8 @@ func (cb *ClusterBuilder) buildConnectOriginate(
 			},
 		},
 		TransportSocket: &core.TransportSocket{
-			Name: "tls",
-			ConfigType: &core.TransportSocket_TypedConfig{TypedConfig: protoconv.MessageToAny(&tlsv3.UpstreamTlsContext{
-				CommonTlsContext: ctx,
-			})},
+			Name:       "tls",
+			ConfigType: &core.TransportSocket_TypedConfig{TypedConfig: protoconv.MessageToAny(tlsContext)},
 		},
 	}
 

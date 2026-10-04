@@ -15,7 +15,10 @@
 package security
 
 import (
+	"bytes"
 	"context"
+	"crypto/x509"
+	"encoding/pem"
 	"fmt"
 	"net/http"
 	"os"
@@ -128,6 +131,9 @@ const (
 
 	// CACRLFilePath is the well-known path for the plugged-in CA's CRL file
 	CACRLFilePath = "/var/run/secrets/istio/crl/ca-crl.pem"
+
+	// SPIFFEBundleMapPathEnv is the sole standard workload bundle-map selector.
+	SPIFFEBundleMapPathEnv = "SPIFFE_BUNDLE_MAP_PATH"
 )
 
 // TODO: For 1.8, make sure MeshConfig is updated with those settings,
@@ -174,6 +180,10 @@ type Options struct {
 	// TrustDomain corresponds to the trust root of a system.
 	// https://github.com/spiffe/spiffe/blob/master/standards/SPIFFE-ID.md#21-trust-domain
 	TrustDomain string
+
+	// SPIFFEBundleMapPath selects the standard workload-domain bundle projection.
+	// This is independent of CA/xDS endpoint trust and external file-root TLS.
+	SPIFFEBundleMapPath string
 
 	// WorkloadRSAKeySize is the size of a private key for a workload certificate.
 	WorkloadRSAKeySize int
@@ -302,6 +312,17 @@ type SecretItem struct {
 	PrivateKey       []byte
 
 	RootCert []byte
+
+	// A nonnil map selects domain-bound mesh ROOTCA validation, including an
+	// empty map that actively denies every domain. Never flatten these roots.
+	TrustDomainBundles map[string][]byte
+	// Known native local workload domain, used only for the explicit empty
+	// typed entry required when the complete authority set is empty.
+	LocalTrustDomain string
+	// Native public workload CRL input for mapped ROOTCA. Nil means it has not
+	// been provided; an explicit empty slice denies after removal/read failure.
+	// This is in-process SDS input, not a bundle-map field or root declaration.
+	WorkloadCRL []byte
 
 	// ResourceName passed from envoy SDS discovery request.
 	// "ROOTCA" for root cert request, "default" for key/cert request.
@@ -581,4 +602,41 @@ func SdsCertificateConfigFromResourceNameForOSCACert(resource string) (SdsCertif
 		return SdsCertificateConfig{}, false
 	}
 	return SdsCertificateConfig{"", "", resource}, true
+}
+
+// ParseWorkloadCRLs validates the single native public CRL input for both
+// its SDS store and the cache validity-transition scheduler. CRLs grant no
+// anchors; issuer/signature/chain coverage remains with the selected verifier.
+func ParseWorkloadCRLs(data []byte, now time.Time) ([]*x509.RevocationList, error) {
+	var crls []*x509.RevocationList
+	for rest := bytes.TrimSpace(data); len(rest) != 0; {
+		if !bytes.HasPrefix(rest, []byte("-----BEGIN X509 CRL-----")) {
+			return nil, fmt.Errorf("unexpected workload CRL material")
+		}
+		end := bytes.Index(rest, []byte("-----END X509 CRL-----"))
+		if end < 0 {
+			return nil, fmt.Errorf("unterminated workload CRL")
+		}
+		end += len("-----END X509 CRL-----")
+		if bytes.Count(rest[:end], []byte("-----BEGIN")) != 1 {
+			return nil, fmt.Errorf("skipped workload CRL block")
+		}
+		block, tail := pem.Decode(rest[:end])
+		if block == nil || block.Type != "X509 CRL" || len(block.Headers) != 0 || len(bytes.TrimSpace(tail)) != 0 {
+			return nil, fmt.Errorf("invalid workload CRL PEM")
+		}
+		crl, err := x509.ParseRevocationList(block.Bytes)
+		if err != nil {
+			return nil, err
+		}
+		if crl.ThisUpdate.After(now) || crl.NextUpdate.IsZero() || !crl.NextUpdate.After(now) {
+			return nil, fmt.Errorf("workload CRL is not current")
+		}
+		crls = append(crls, crl)
+		rest = bytes.TrimSpace(rest[end:])
+	}
+	if len(crls) == 0 {
+		return nil, fmt.Errorf("empty workload CRL")
+	}
+	return crls, nil
 }

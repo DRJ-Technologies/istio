@@ -203,6 +203,17 @@ func BuildListenerTLSContext(serverTLSSettings *networking.ServerTLSSettings,
 		applyDownstreamTLSDefaults(push.Mesh.GetTlsDefaults(), ctx.CommonTlsContext)
 		applyServerTLSSettings(serverTLSSettings, ctx.CommonTlsContext)
 	}
+	if authnmodel.UsesWorkloadDomainBundles(proxy) && serverTLSSettings.Mode == networking.ServerTLSSettings_ISTIO_MUTUAL {
+		// This native branch does not otherwise carry the original pin inputs
+		// into CVC. Preserve them until mapped-policy refusal can observe them.
+		validation := ctx.CommonTlsContext.GetCombinedValidationContext().GetDefaultValidationContext()
+		if validation != nil {
+			validation.VerifyCertificateSpki = serverTLSSettings.VerifyCertificateSpki
+			validation.VerifyCertificateHash = serverTLSSettings.VerifyCertificateHash
+		}
+	}
+	authnmodel.ApplyMappedRootContext(proxy, ctx.CommonTlsContext, serverTLSSettings.CaCrl)
+	authnmodel.DisableMappedDownstreamResumption(proxy, ctx)
 
 	// Compliance for Envoy TLS downstreams.
 	authnmodel.EnforceCompliance(ctx.CommonTlsContext)

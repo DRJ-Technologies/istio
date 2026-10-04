@@ -245,6 +245,7 @@ type AgentOptions struct {
 // associated clients to sign certificates (when not using files), and the local XDS proxy (including
 // health checking for VMs and DNS proxying).
 func NewAgent(proxyConfig *mesh.ProxyConfig, agentOpts *AgentOptions, sopts *security.Options, eopts envoy.ProxyConfig) *Agent {
+	proxyConfig = proxyConfigWithBundleMap(proxyConfig, sopts)
 	return &Agent{
 		proxyConfig: proxyConfig,
 		cfg:         agentOpts,

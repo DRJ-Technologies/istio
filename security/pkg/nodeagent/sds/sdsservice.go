@@ -301,6 +301,12 @@ func toEnvoySecret(s *security.SecretItem, caRootPath string, pkpConf *mesh.Priv
 		cfg, ok = security.SdsCertificateConfigFromResourceName(s.ResourceName)
 	}
 	if s.ResourceName == security.RootCertReqResourceName || (ok && cfg.IsRootCertificate()) {
+		if s.ResourceName == security.RootCertReqResourceName && s.TrustDomainBundles != nil {
+			// Removal, malformed data and mapped read errors must be an accepted
+			// denying update. Secret withdrawal/NACK can retain referenced roots.
+			secret.Type = &tls.Secret_ValidationContext{ValidationContext: domainBundleValidationContext(s)}
+			return secret
+		}
 		secretValidationContext := &tls.Secret_ValidationContext{
 			ValidationContext: &tls.CertificateValidationContext{
 				TrustedCa: &core.DataSource{

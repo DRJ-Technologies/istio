@@ -22,6 +22,7 @@ import (
 
 	"istio.io/istio/pilot/pkg/model"
 	"istio.io/istio/pilot/pkg/networking/util"
+	secmodel "istio.io/istio/pilot/pkg/security/model"
 	"istio.io/istio/pilot/pkg/xds/endpoints"
 	"istio.io/istio/pkg/config/schema/kind"
 	"istio.io/istio/pkg/util/hash"
@@ -44,6 +45,7 @@ type clusterCache struct {
 	proxyClusterID          string         // identifies the kubernetes cluster a proxy is in
 	proxyType               model.NodeType // identifies this proxy type
 	hbone                   bool
+	workloadDomainBundles   bool // changes ROOTCA identity constraints and resumption
 	proxyView               model.ProxyView
 	metadataCerts           *metadataCerts // metadata certificates of proxy
 	endpointBuilder         *endpoints.EndpointBuilder
@@ -86,6 +88,8 @@ func (t *clusterCache) Key() any {
 	h.WriteString(strconv.FormatBool(t.supportsIPv4))
 	h.Write(Separator)
 	h.WriteString(strconv.FormatBool(t.hbone))
+	h.Write(Separator)
+	h.WriteString(strconv.FormatBool(t.workloadDomainBundles))
 	h.Write(Separator)
 
 	if t.proxyView != nil {
@@ -200,6 +204,7 @@ func buildClusterKey(service *model.Service, port *model.Port, cb *ClusterBuilde
 		proxyType:               cb.proxyType,
 		proxyView:               cb.proxyView,
 		hbone:                   cb.sendHbone,
+		workloadDomainBundles:   secmodel.UsesWorkloadDomainBundles(proxy),
 		http2:                   port.Protocol.IsHTTP2(),
 		downstreamAuto:          cb.sidecarProxy() && port.Protocol.IsUnsupported(),
 		supportsIPv4:            cb.supportsIPv4,
