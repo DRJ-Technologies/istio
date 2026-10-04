@@ -210,6 +210,9 @@ func TestDomainBundleSDSPreservesDefaultAndExternalRootResources(t *testing.T) {
 }
 
 func TestDomainBundleSDSReferencedROOTCAUpdateDenyAndRecovery(t *testing.T) {
+	// setupSDS changes cwd for its native relative UDS. Keep a restoration
+	// handle so a later real-reader test cannot inherit a deleted directory.
+	t.Chdir(t.TempDir())
 	s := setupSDS(t)
 	root := s.Connect()
 	item := func(roots map[string][]byte) *security.SecretItem {
