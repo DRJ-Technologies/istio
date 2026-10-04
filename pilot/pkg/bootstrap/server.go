@@ -305,11 +305,10 @@ func NewServer(args *PilotArgs, initFuncs ...func(*Server)) (*Server, error) {
 		return nil, err
 	}
 
-	if features.MultiRootMesh {
-		// Initialize trust bundle after mesh config which it depends on
-		s.workloadTrustBundle = tb.NewTrustBundle(nil, e.Watcher)
-		e.TrustBundle = s.workloadTrustBundle
-	}
+	// The per-domain namespace projection is independent of PCDS/MultiRootMesh.
+	// Authority comes from local MeshConfig and the native workload CA/RA only.
+	s.workloadTrustBundle = tb.NewTrustBundle(nil, e.Watcher)
+	e.TrustBundle = s.workloadTrustBundle
 
 	// Options based on the current 'defaults' in istio.
 	caOpts := &caOptions{
@@ -1356,21 +1355,15 @@ func (s *Server) addIstioCAToTrustBundle(args *PilotArgs) error {
 func (s *Server) initWorkloadTrustBundle(args *PilotArgs) error {
 	var err error
 
-	if !features.MultiRootMesh {
-		return nil
-	}
-
 	s.workloadTrustBundle.UpdateCb(func() {
+		if !features.MultiRootMesh {
+			return
+		}
 		pushReq := &model.PushRequest{
 			Reason: model.NewReasonStats(model.GlobalUpdate),
 			Forced: true,
 		}
 		s.XDSServer.ConfigUpdate(pushReq)
-	})
-
-	s.addStartFunc("remote trust anchors", func(stop <-chan struct{}) error {
-		go s.workloadTrustBundle.ProcessRemoteTrustAnchors(stop, tb.RemoteDefaultPollPeriod)
-		return nil
 	})
 
 	// MeshConfig: Add initial roots
@@ -1381,7 +1374,9 @@ func (s *Server) initWorkloadTrustBundle(args *PilotArgs) error {
 
 	// MeshConfig:Add callback for mesh config update
 	s.environment.AddMeshHandler(func() {
-		_ = s.workloadTrustBundle.AddMeshConfigUpdate(s.environment.Mesh())
+		if err := s.workloadTrustBundle.AddMeshConfigUpdate(s.environment.Mesh()); err != nil {
+			log.Errorf("invalid domain trust bundle; all projected authority revoked: %v", err)
+		}
 	})
 
 	err = s.addIstioCAToTrustBundle(args)

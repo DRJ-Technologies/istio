@@ -108,6 +108,7 @@ func (s *Server) initKubeOptions(args *PilotArgs) {
 	args.RegistryOptions.KubeOptions.XDSUpdater = s.XDSServer
 	args.RegistryOptions.KubeOptions.MeshNetworksWatcher = s.environment.NetworksWatcher
 	args.RegistryOptions.KubeOptions.MeshWatcher = s.environment.Watcher
+	args.RegistryOptions.KubeOptions.WorkloadTrustBundle = s.workloadTrustBundle
 	args.RegistryOptions.KubeOptions.SystemNamespace = args.Namespace
 	args.RegistryOptions.KubeOptions.MeshServiceController = s.ServiceController()
 }

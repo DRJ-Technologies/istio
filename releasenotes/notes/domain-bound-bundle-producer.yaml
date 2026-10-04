@@ -1,0 +1,13 @@
+apiVersion: release-notes/v2
+kind: feature
+area: security
+releaseNotes:
+  - |
+    **Added** a standard SPIFFE Bundle Map to the existing namespace trust-domain ConfigMap.
+    Native workload CA/RA roots bind only to the local trust domain; PEM caCertificates bind
+    only to their explicit trustDomains (unlabelled entries are local-only). The compatibility
+    names are derived from the same atomic snapshot and are not independent root authority.
+    This fork's domain-bound producer rejects aliases, noncanonical domains, malformed PEM
+    and unsupported bundle endpoint/signer declarations. Invalid updates publish an empty
+    authoritative map. PCDS and remote mesh discovery do not grant mapped authority. Consumers,
+    connection removal and separate-root runtime qualification are independent prerequisites.

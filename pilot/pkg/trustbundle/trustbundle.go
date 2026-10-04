@@ -19,7 +19,6 @@ import (
 	"encoding/pem"
 	"fmt"
 	"sort"
-	"strings"
 	"sync"
 	"time"
 
@@ -77,6 +76,7 @@ type TrustBundle struct {
 	endpointUpdateChan chan struct{}
 	remoteCaCertPool   *x509.CertPool
 	meshConfig         mesh.Watcher
+	domains            domainBundleState
 }
 
 var (
@@ -99,6 +99,7 @@ func NewTrustBundle(remoteCaCertPool *x509.CertPool, meshConfig mesh.Watcher) *T
 		endpointUpdateChan: make(chan struct{}, 1),
 		endpoints:          []string{},
 		meshConfig:         meshConfig,
+		domains:            newDomainBundleState(),
 	}
 	if remoteCaCertPool == nil {
 		tb.remoteCaCertPool, err = x509.SystemCertPool()
@@ -112,6 +113,8 @@ func NewTrustBundle(remoteCaCertPool *x509.CertPool, meshConfig mesh.Watcher) *T
 }
 
 func (tb *TrustBundle) UpdateCb(updatecb func()) {
+	tb.mutex.Lock()
+	defer tb.mutex.Unlock()
 	tb.updatecb = updatecb
 }
 
@@ -125,26 +128,13 @@ func (tb *TrustBundle) GetTrustBundle() []string {
 }
 
 func verifyTrustAnchor(trustAnchor string) error {
-	block, _ := pem.Decode([]byte(trustAnchor))
-	if block == nil {
-		return fmt.Errorf("failed to decode pem certificate")
-	}
-	cert, err := x509.ParseCertificate(block.Bytes)
-	if err != nil {
-		return fmt.Errorf("failed to parse X.509 certificate: %v", err)
-	}
-	if !cert.IsCA {
-		return fmt.Errorf("certificate is not a CA certificate")
-	}
-	return nil
+	_, err := parseDomainTrustAnchors([]string{trustAnchor})
+	return err
 }
 
-func (tb *TrustBundle) mergeInternal() {
+func (tb *TrustBundle) mergeInternalLocked() {
 	var mergeCerts []string
 	certMap := sets.New[string]()
-
-	tb.mutex.Lock()
-	defer tb.mutex.Unlock()
 
 	for _, configSource := range tb.sourceConfig {
 		for _, cert := range configSource.Certs {
@@ -159,39 +149,43 @@ func (tb *TrustBundle) mergeInternal() {
 
 // UpdateTrustAnchor : External Function to merge a TrustAnchor config with the existing TrustBundle
 func (tb *TrustBundle) UpdateTrustAnchor(anchorConfig *TrustAnchorUpdate) error {
-	var ok bool
-	var err error
-
-	tb.mutex.RLock()
+	if anchorConfig == nil {
+		return fmt.Errorf("nil trust anchor update")
+	}
+	certs, err := parseDomainTrustAnchors(anchorConfig.Certs)
+	tb.mutex.Lock()
 	cachedConfig, ok := tb.sourceConfig[anchorConfig.Source]
-	tb.mutex.RUnlock()
 	if !ok {
+		tb.mutex.Unlock()
 		return fmt.Errorf("invalid source of TrustBundle configuration %v", anchorConfig.Source)
 	}
-
-	// Check if anything needs to be changed at all
-	if slices.Equal(anchorConfig.Certs, cachedConfig.Certs) {
-		trustBundleLog.Debugf("no change to trustAnchor configuration after recent update")
-		return nil
-	}
-
-	for _, cert := range anchorConfig.Certs {
-		err = verifyTrustAnchor(cert)
-		if err != nil {
-			return err
+	// Only native workload CA/RA roots bind implicitly to the local domain. A
+	// legacy flat source (including fetched endpoint roots) never grants a domain.
+	native := anchorConfig.Source == SourceIstioCA || anchorConfig.Source == SourceIstioRA
+	if err != nil {
+		if native {
+			tb.domains.invalidSources.Insert(anchorConfig.Source)
 		}
+		handlers := tb.refreshDomainBundleLocked()
+		tb.mutex.Unlock()
+		notifyDomainBundleHandlers(handlers)
+		return err
 	}
-	tb.mutex.Lock()
-	tb.sourceConfig[anchorConfig.Source] = anchorConfig.TrustAnchorConfig
+	changed := !slices.Equal(anchorConfig.Certs, cachedConfig.Certs)
+	if changed {
+		tb.sourceConfig[anchorConfig.Source] = TrustAnchorConfig{Certs: slices.Clone(anchorConfig.Certs)}
+		tb.mergeInternalLocked()
+	}
+	if native {
+		tb.domains.nativeRoots[anchorConfig.Source] = certs
+		tb.domains.invalidSources.Delete(anchorConfig.Source)
+	}
+	handlers := tb.refreshDomainBundleLocked()
+	updatecb := tb.updatecb
 	tb.mutex.Unlock()
-	tb.mergeInternal()
-
-	trustBundleLog.Infof("updating Source %v with certs %v",
-		anchorConfig.Source,
-		strings.Join(anchorConfig.TrustAnchorConfig.Certs, "\n"))
-
-	if tb.updatecb != nil {
-		tb.updatecb()
+	notifyDomainBundleHandlers(handlers)
+	if changed && updatecb != nil {
+		updatecb()
 	}
 	return nil
 }
@@ -213,31 +207,31 @@ func (tb *TrustBundle) updateRemoteEndpoint(spiffeEndpoints []string) {
 
 // AddMeshConfigUpdate : Update trustAnchor configurations from meshConfig
 func (tb *TrustBundle) AddMeshConfigUpdate(cfg *meshconfig.MeshConfig) error {
-	var err error
-	if cfg != nil {
-		certs := []string{}
-		endpoints := []string{}
-		for _, pemCert := range cfg.GetCaCertificates() {
-			cert := pemCert.GetPem()
-			if cert != "" {
-				certs = append(certs, cert)
-			} else if pemCert.GetSpiffeBundleUrl() != "" {
-				endpoints = append(endpoints, pemCert.GetSpiffeBundleUrl())
-			}
+	local, bindings, err := meshDomainTrustAnchors(cfg)
+	tb.mutex.Lock()
+	tb.domains.localDomain = local
+	tb.domains.meshRoots = bindings
+	tb.domains.meshValid = err == nil
+	// The legacy flat API is retained for existing consumers, but explicitly
+	// foreign roots must not be pooled into the local workload root response.
+	changed := false
+	if err == nil {
+		localPEM := make([]string, 0, len(bindings[local]))
+		for _, cert := range bindings[local] {
+			localPEM = append(localPEM, string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: cert.Raw})))
 		}
-
-		err = tb.UpdateTrustAnchor(&TrustAnchorUpdate{
-			TrustAnchorConfig: TrustAnchorConfig{Certs: certs},
-			Source:            SourceMeshConfig,
-		})
-		if err != nil {
-			trustBundleLog.Errorf("failed to update meshConfig PEM trustAnchors: %v", err)
-			return err
-		}
-
-		tb.updateRemoteEndpoint(endpoints)
+		changed = !slices.Equal(localPEM, tb.sourceConfig[SourceMeshConfig].Certs)
+		tb.sourceConfig[SourceMeshConfig] = TrustAnchorConfig{Certs: localPEM}
+		tb.mergeInternalLocked()
 	}
-	return nil
+	handlers := tb.refreshDomainBundleLocked()
+	updatecb := tb.updatecb
+	tb.mutex.Unlock()
+	notifyDomainBundleHandlers(handlers)
+	if changed && updatecb != nil {
+		updatecb()
+	}
+	return err
 }
 
 func (tb *TrustBundle) fetchRemoteTrustAnchors() {

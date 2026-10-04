@@ -25,6 +25,7 @@ import (
 	meshconfig "istio.io/api/mesh/v1alpha1"
 	"istio.io/istio/pilot/pkg/features"
 	"istio.io/istio/pilot/pkg/networking/plugin/authn"
+	"istio.io/istio/pilot/pkg/trustbundle"
 	"istio.io/istio/pkg/config/constants"
 	"istio.io/istio/pkg/config/mesh"
 	"istio.io/istio/pkg/kube"
@@ -42,12 +43,13 @@ var TrustDomainsNamespaceConfigMap = features.TrustDomainsConfigMapName
 // anyTrustDomain is written instead of a list when trust domain validation is skipped.
 const anyTrustDomain = "*"
 
-// TrustDomainsController writes the trust domains peers are accepted from into a ConfigMap in each namespace,
-// for proxies such as ztunnel that are not given the mesh config. Sidecars and waypoints get the same set
-// over xDS. Unlike the root certificate, this does not depend on which CA issues certificates, so it runs
-// regardless of whether istiod distributes the CA certificate.
+// TrustDomainsController projects one authoritative per-domain bundle snapshot
+// and its compatibility names into a ConfigMap in each watched namespace. It
+// runs independently of the root-cert controller and PCDS. Production authority
+// is owned by the local config cluster's native workload TrustBundle.
 type TrustDomainsController struct {
 	meshWatcher mesh.Watcher
+	trustBundle *trustbundle.TrustBundle
 
 	queue controllers.Queue
 
@@ -58,9 +60,10 @@ type TrustDomainsController struct {
 }
 
 // NewTrustDomainsController returns a controller writing the trust domains accepted according to meshWatcher.
-func NewTrustDomainsController(kubeClient kube.Client, meshWatcher mesh.Watcher) *TrustDomainsController {
+func NewTrustDomainsController(kubeClient kube.Client, meshWatcher mesh.Watcher, trustBundle *trustbundle.TrustBundle) *TrustDomainsController {
 	c := &TrustDomainsController{
 		meshWatcher: meshWatcher,
+		trustBundle: trustBundle,
 		// kube-system is not skipped to enable deploying ztunnel in that namespace
 		ignoredNamespaces: inject.IgnoredNamespaces.Copy().Delete(constants.KubeSystemNamespace),
 	}
@@ -91,9 +94,16 @@ func (c *TrustDomainsController) Run(stop <-chan struct{}) {
 		c.queue.ShutDownEarly()
 		return
 	}
-	// The trust domains come from the mesh config, so rewrite them in every watched namespace when it changes.
-	reg := c.meshWatcher.AddMeshHandler(c.syncAll)
-	defer c.meshWatcher.DeleteMeshHandler(reg)
+	if c.trustBundle != nil {
+		// MeshConfig and native workload CA/RA changes publish one complete snapshot.
+		unregister := c.trustBundle.AddDomainBundleHandler(c.syncAll)
+		defer unregister()
+	} else {
+		// Legacy names-only callers do not supply workload root authority.
+		reg := c.meshWatcher.AddMeshHandler(c.syncAll)
+		defer c.meshWatcher.DeleteMeshHandler(reg)
+	}
+	c.syncAll()
 	c.queue.Run(stop)
 	controllers.ShutdownAll(c.configmaps, c.namespaces)
 }
@@ -119,6 +129,19 @@ func (c *TrustDomainsController) reconcile(o types.NamespacedName) error {
 	}
 	if !c.shouldProcessNamespace(ns) {
 		return nil
+	}
+	if c.trustBundle != nil {
+		snapshot := c.trustBundle.GetDomainBundle()
+		names := ""
+		if domains := snapshot.TrustDomains(); len(domains) != 0 {
+			names = strings.Join(domains, "\n") + "\n"
+		}
+		return k8s.InsertMapToConfigMap(c.configmaps, metav1.ObjectMeta{
+			Name: TrustDomainsNamespaceConfigMap, Namespace: ns, Labels: configMapLabel,
+		}, map[string]string{
+			constants.SPIFFEBundleMapConfigMapDataName:       string(snapshot.BundleMap()),
+			constants.TrustDomainsNamespaceConfigMapDataName: names,
+		})
 	}
 	return k8s.InsertDataToConfigMap(
 		c.configmaps,

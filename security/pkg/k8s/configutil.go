@@ -16,6 +16,7 @@ package k8s
 
 import (
 	"fmt"
+	"maps"
 
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
@@ -32,14 +33,18 @@ func InsertDataToConfigMap(
 	dataKeyName string,
 	data []byte,
 ) error {
+	return InsertMapToConfigMap(client, meta, map[string]string{dataKeyName: string(data)})
+}
+
+// InsertMapToConfigMap writes related keys in one API mutation, preserving
+// unrelated data. Consumers must never observe a new bundle with old names.
+func InsertMapToConfigMap(client kclient.Client[*v1.ConfigMap], meta metav1.ObjectMeta, data map[string]string) error {
 	configmap := client.Get(meta.Name, meta.Namespace)
 	if configmap == nil {
 		// Create a new ConfigMap.
 		configmap = &v1.ConfigMap{
 			ObjectMeta: meta,
-			Data: map[string]string{
-				dataKeyName: string(data),
-			},
+			Data:       maps.Clone(data),
 		}
 		if _, err := client.Create(configmap); err != nil {
 			// Namespace may be deleted between now... and our previous check. Just skip this, we cannot create into deleted ns
@@ -55,7 +60,7 @@ func InsertDataToConfigMap(
 		}
 	} else {
 		// Otherwise, update the config map if changes are required
-		err := updateDataInConfigMap(client, configmap, dataKeyName, data)
+		err := updateMapInConfigMap(client, configmap, data)
 		if err != nil {
 			return err
 		}
@@ -66,12 +71,12 @@ func InsertDataToConfigMap(
 // insertData merges a configmap with a map, and returns true if any changes were made
 func insertData(cm *v1.ConfigMap, data map[string]string) bool {
 	if cm.Data == nil {
-		cm.Data = data
+		cm.Data = maps.Clone(data)
 		return true
 	}
 	needsUpdate := false
 	for k, v := range data {
-		if cm.Data[k] != v {
+		if current, ok := cm.Data[k]; !ok || current != v {
 			needsUpdate = true
 		}
 		cm.Data[k] = v
@@ -80,14 +85,15 @@ func insertData(cm *v1.ConfigMap, data map[string]string) bool {
 }
 
 func updateDataInConfigMap(c kclient.Client[*v1.ConfigMap], cm *v1.ConfigMap, dataKeyName string, data []byte) error {
+	return updateMapInConfigMap(c, cm, map[string]string{dataKeyName: string(data)})
+}
+
+func updateMapInConfigMap(c kclient.Client[*v1.ConfigMap], cm *v1.ConfigMap, data map[string]string) error {
 	if cm == nil {
 		return fmt.Errorf("cannot update nil configmap")
 	}
 	newCm := cm.DeepCopy()
-	cmData := map[string]string{
-		dataKeyName: string(data),
-	}
-	if needsUpdate := insertData(newCm, cmData); !needsUpdate {
+	if needsUpdate := insertData(newCm, data); !needsUpdate {
 		log.Debugf("ConfigMap %s/%s is already up to date", cm.Namespace, cm.Name)
 		return nil
 	}
