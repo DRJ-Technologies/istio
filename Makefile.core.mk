@@ -169,7 +169,7 @@ GO_FETCH_RETRY ?= SSL_ERROR_SYSCALL|TLS handshake timeout|i/o timeout|connection
 ifneq ($(origin ISTIO_ENVOY_LINUX_RELEASE_PATH),undefined)
 .PHONY: $(TARGET_OUT)/istio_is_init
 endif
-ifneq ($(DEBUG_IMAGE),)
+ifneq ($(origin DEBUG_IMAGE),undefined)
 ifneq ($(origin ISTIO_ENVOY_LINUX_DEBUG_PATH),undefined)
 .PHONY: $(TARGET_OUT)/istio_is_init
 endif

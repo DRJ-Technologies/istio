@@ -32,6 +32,8 @@ func TestExplicitEnvoyInputs(t *testing.T) {
 		for _, tc := range []struct {
 			name, release, debug string
 			debugImage           bool
+			emptyDebugImage      bool
+			failureText          string
 			fails                bool
 		}{
 			{name: "release", release: "valid"},
@@ -43,6 +45,10 @@ func TestExplicitEnvoyInputs(t *testing.T) {
 			{name: "unreadable-release", release: "unreadable", fails: true},
 			{name: "nonexecutable-release", release: "nonexecutable", fails: true},
 			{name: "debug-and-release", release: "valid", debug: "valid", debugImage: true},
+			{name: "empty-debug-flag", release: "valid", debug: "valid", debugImage: true, emptyDebugImage: true},
+			{name: "empty-debug-flag-missing-input", release: "valid", debug: "missing", debugImage: true, emptyDebugImage: true, fails: true},
+			{name: "release-aliases-debug-output", release: "debug-native-output", debug: "valid", debugImage: true, fails: true, failureText: "aliases the selected native debug destination"},
+			{name: "release-at-unselected-debug-output", release: "debug-native-output"},
 			{name: "empty-debug", release: "valid", debug: "empty", debugImage: true, fails: true},
 			{name: "missing-debug", release: "valid", debug: "missing", debugImage: true, fails: true},
 			{name: "directory-debug", release: "valid", debug: "directory", debugImage: true, fails: true},
@@ -86,6 +92,9 @@ func TestExplicitEnvoyInputs(t *testing.T) {
 					path := filepath.Join(root, name)
 					if kind == "native-output" {
 						path = filepath.Join(out, name, "envoy")
+					}
+					if kind == "debug-native-output" {
+						path = filepath.Join(out, "debug", "envoy")
 					}
 					if kind == "target-output" {
 						path = envoy
@@ -133,7 +142,19 @@ func TestExplicitEnvoyInputs(t *testing.T) {
 					cmd.Env = append(cmd.Env, "ISTIO_ENVOY_LINUX_DEBUG_PATH="+input("debug", tc.debug))
 				}
 				if tc.debugImage {
-					cmd.Env = append(cmd.Env, "DEBUG_IMAGE=1")
+					flag := "1"
+					if tc.emptyDebugImage {
+						flag = ""
+					}
+					cmd.Env = append(cmd.Env, "DEBUG_IMAGE="+flag)
+				}
+				previous := make(map[string]string)
+				for _, mode := range []string{"release", "debug"} {
+					bytes, err := os.ReadFile(filepath.Join(out, mode, "envoy"))
+					if err != nil {
+						t.Fatal(err)
+					}
+					previous[mode] = string(bytes)
 				}
 				log, err := cmd.CombinedOutput()
 				if (err != nil) != tc.fails {
@@ -146,7 +167,11 @@ func TestExplicitEnvoyInputs(t *testing.T) {
 				want := "selected-" + arch + "-release"
 				if tc.fails {
 					want = "previous-artifact"
-					if !strings.Contains(string(log), "must be a readable executable regular file") {
+					failureText := tc.failureText
+					if failureText == "" {
+						failureText = "must be a readable executable regular file"
+					}
+					if !strings.Contains(string(log), failureText) {
 						t.Fatalf("did not refuse the explicit input: %s", log)
 					}
 				}
@@ -155,7 +180,7 @@ func TestExplicitEnvoyInputs(t *testing.T) {
 				}
 				for _, mode := range []string{"release", "debug"} {
 					got, err := os.ReadFile(filepath.Join(out, mode, "envoy"))
-					want := "previous-image-artifact"
+					want := previous[mode]
 					if !tc.fails && (mode == "release" || tc.debugImage) {
 						want = "selected-" + arch + "-" + mode
 					}
@@ -175,7 +200,7 @@ func TestExplicitEnvoyInputs(t *testing.T) {
 }
 
 func TestExplicitEnvoyReconsumesInit(t *testing.T) {
-	for _, kind := range []string{"release", "empty-release", "debug", "unselected-debug", "default-cache"} {
+	for _, kind := range []string{"release", "empty-release", "debug", "empty-debug-flag", "unselected-debug", "default-cache"} {
 		t.Run(kind, func(t *testing.T) {
 			root := t.TempDir()
 			out := filepath.Join(root, "out")
@@ -203,6 +228,8 @@ func TestExplicitEnvoyReconsumesInit(t *testing.T) {
 				cmd.Env = append(cmd.Env, "ISTIO_ENVOY_LINUX_RELEASE_PATH=")
 			case "debug":
 				cmd.Env = append(cmd.Env, "DEBUG_IMAGE=1", "ISTIO_ENVOY_LINUX_DEBUG_PATH="+filepath.Join(root, "selected"))
+			case "empty-debug-flag":
+				cmd.Env = append(cmd.Env, "DEBUG_IMAGE=", "ISTIO_ENVOY_LINUX_DEBUG_PATH="+filepath.Join(root, "selected"))
 			case "unselected-debug":
 				cmd.Env = append(cmd.Env, "ISTIO_ENVOY_LINUX_DEBUG_PATH="+filepath.Join(root, "selected"))
 			}
@@ -210,7 +237,7 @@ func TestExplicitEnvoyReconsumesInit(t *testing.T) {
 			if err != nil {
 				t.Fatalf("native Make prerequisite check failed: %v\n%s", err, log)
 			}
-			selected := kind == "release" || kind == "empty-release" || kind == "debug"
+			selected := kind == "release" || kind == "empty-release" || kind == "debug" || kind == "empty-debug-flag"
 			if strings.Contains(string(log), "bin/retry.sh") != selected {
 				t.Fatalf("stale marker selection incorrect for %s\n%s", kind, log)
 			}

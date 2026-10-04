@@ -64,7 +64,7 @@ if [[ ${ISTIO_ENVOY_LINUX_RELEASE_PATH+x} ]]; then
   check_explicit_envoy_path "$ISTIO_ENVOY_LINUX_RELEASE_PATH" ISTIO_ENVOY_LINUX_RELEASE_PATH
   explicit_release_path=true
 fi
-if [[ -n "${DEBUG_IMAGE:-}" && ${ISTIO_ENVOY_LINUX_DEBUG_PATH+x} ]]; then
+if [[ ${DEBUG_IMAGE+x} && ${ISTIO_ENVOY_LINUX_DEBUG_PATH+x} ]]; then
   check_explicit_envoy_path "$ISTIO_ENVOY_LINUX_DEBUG_PATH" ISTIO_ENVOY_LINUX_DEBUG_PATH
   explicit_debug_path=true
 fi
@@ -77,6 +77,15 @@ ISTIO_ENVOY_LINUX_DEBUG_PATH="${ISTIO_ENVOY_LINUX_DEBUG_PATH:-${ISTIO_ENVOY_LINU
 ISTIO_ENVOY_LINUX_RELEASE_DIR="${ISTIO_ENVOY_LINUX_RELEASE_DIR:-${TARGET_OUT_LINUX}/release}"
 ISTIO_ENVOY_LINUX_RELEASE_NAME="${ISTIO_ENVOY_LINUX_RELEASE_NAME:-${SIDECAR}-${ISTIO_ENVOY_VERSION}}"
 ISTIO_ENVOY_LINUX_RELEASE_PATH="${ISTIO_ENVOY_LINUX_RELEASE_PATH:-${ISTIO_ENVOY_LINUX_RELEASE_DIR}/${ISTIO_ENVOY_LINUX_RELEASE_NAME}}"
+
+# Debug is copied first. Refuse a cross-output alias before either source can be
+# overwritten; using the same selected file for both modes remains safe.
+if [[ ${DEBUG_IMAGE+x} && "$explicit_release_path" == true &&
+      "$ISTIO_ENVOY_LINUX_RELEASE_PATH" -ef "$ISTIO_ENVOY_LINUX_DEBUG_DIR/${SIDECAR}" &&
+      ! "$ISTIO_ENVOY_LINUX_RELEASE_PATH" -ef "$ISTIO_ENVOY_LINUX_DEBUG_PATH" ]]; then
+  echo "Explicit release source aliases the selected native debug destination" >&2
+  exit 1
+fi
 
 # There is no longer an Istio built Envoy binary available for the Mac. Copy the Linux binary as the Mac binary was
 # very old and likely no one was really using it (at least temporarily).
@@ -167,11 +176,11 @@ copy_explicit_envoy() {
 mkdir -p "${TARGET_OUT}"
 
 # Explicit local inputs require no downloader or credential setup.
-if [[ "$explicit_release_path" == false || ( -n "${DEBUG_IMAGE:-}" && "$explicit_debug_path" == false ) ]]; then
+if [[ "$explicit_release_path" == false || ( ${DEBUG_IMAGE+x} && "$explicit_debug_path" == false ) ]]; then
   set_download_command
 fi
 
-if [[ -n "${DEBUG_IMAGE:-}" ]]; then
+if [[ ${DEBUG_IMAGE+x} ]]; then
   # Download and extract the Envoy linux debug binary.
   if [[ "$explicit_debug_path" == false ]]; then
     download_envoy_if_necessary "${ISTIO_ENVOY_LINUX_DEBUG_URL}" "$ISTIO_ENVOY_LINUX_DEBUG_PATH" "${SIDECAR}"
