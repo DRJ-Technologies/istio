@@ -425,6 +425,16 @@ spec:
     resources:
   {{ template "resources" . }}
     volumeMounts:
+    {{- with (index .ProxyConfig.ProxyMetadata "SPIFFE_BUNDLE_MAP_PATH") }}
+    - name: istio-trust-domains
+      mountPath: {{ directory . | quote }}
+      readOnly: true
+    {{- if ne $.Values.global.pilotCertProvider "istiod" }}
+    - name: istio-ca-crl
+      mountPath: /var/run/secrets/istio/crl
+      readOnly: true
+    {{- end }}
+    {{- end }}
     - name: workload-socket
       mountPath: /var/run/secrets/workload-spiffe-uds
     - name: credential-socket
@@ -442,6 +452,9 @@ spec:
       name: istiod-ca-cert
     - mountPath: /var/run/secrets/istio/crl
       name: istio-ca-crl
+      {{- if (index .ProxyConfig.ProxyMetadata "SPIFFE_BUNDLE_MAP_PATH") }}
+      readOnly: true
+      {{- end }}
     {{- end }}
     - mountPath: /var/lib/istio/data
       name: istio-data
@@ -474,6 +487,15 @@ spec:
       {{ end }}
       {{- end }}
   volumes:
+  {{- with (index .ProxyConfig.ProxyMetadata "SPIFFE_BUNDLE_MAP_PATH") }}
+  - name: istio-trust-domains
+    configMap:
+      name: istio-trust-domains
+      optional: true
+      items:
+      - key: spiffe-bundle-map.json
+        path: {{ base . | quote }}
+  {{- end }}
   - emptyDir:
     name: workload-socket
   - emptyDir:

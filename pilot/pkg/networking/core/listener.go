@@ -203,6 +203,8 @@ func BuildListenerTLSContext(serverTLSSettings *networking.ServerTLSSettings,
 		applyDownstreamTLSDefaults(push.Mesh.GetTlsDefaults(), ctx.CommonTlsContext)
 		applyServerTLSSettings(serverTLSSettings, ctx.CommonTlsContext)
 	}
+	authnmodel.ApplyMappedRootContext(proxy, ctx.CommonTlsContext, serverTLSSettings.CaCrl)
+	authnmodel.DisableMappedDownstreamResumption(proxy, ctx)
 
 	// Compliance for Envoy TLS downstreams.
 	authnmodel.EnforceCompliance(ctx.CommonTlsContext)

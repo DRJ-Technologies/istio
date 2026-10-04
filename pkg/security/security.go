@@ -128,6 +128,9 @@ const (
 
 	// CACRLFilePath is the well-known path for the plugged-in CA's CRL file
 	CACRLFilePath = "/var/run/secrets/istio/crl/ca-crl.pem"
+
+	// SPIFFEBundleMapPathEnv is the sole standard workload bundle-map selector.
+	SPIFFEBundleMapPathEnv = "SPIFFE_BUNDLE_MAP_PATH"
 )
 
 // TODO: For 1.8, make sure MeshConfig is updated with those settings,
@@ -174,6 +177,10 @@ type Options struct {
 	// TrustDomain corresponds to the trust root of a system.
 	// https://github.com/spiffe/spiffe/blob/master/standards/SPIFFE-ID.md#21-trust-domain
 	TrustDomain string
+
+	// SPIFFEBundleMapPath selects the standard workload-domain bundle projection.
+	// This is independent of CA/xDS endpoint trust and external file-root TLS.
+	SPIFFEBundleMapPath string
 
 	// WorkloadRSAKeySize is the size of a private key for a workload certificate.
 	WorkloadRSAKeySize int
@@ -302,6 +309,17 @@ type SecretItem struct {
 	PrivateKey       []byte
 
 	RootCert []byte
+
+	// A nonnil map selects domain-bound mesh ROOTCA validation, including an
+	// empty map that actively denies every domain. Never flatten these roots.
+	TrustDomainBundles map[string][]byte
+	// Known native local workload domain, used only for the explicit empty
+	// typed entry required when the complete authority set is empty.
+	LocalTrustDomain string
+	// Native public workload CRL input for mapped ROOTCA. Nil means it has not
+	// been provided; an explicit empty slice denies after removal/read failure.
+	// This is in-process SDS input, not a bundle-map field or root declaration.
+	WorkloadCRL []byte
 
 	// ResourceName passed from envoy SDS discovery request.
 	// "ROOTCA" for root cert request, "default" for key/cert request.

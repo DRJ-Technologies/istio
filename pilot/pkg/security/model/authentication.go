@@ -167,6 +167,7 @@ func ApplyToCommonTLSContext(tlsContext *tls.CommonTlsContext, proxy *model.Prox
 	// Envoy does not support client validation using multiple CA certificates when multiple certificates are provided.
 	// So we only use what's provided in the ServerTLSSettings.
 	caCert := proxy.Metadata.TLSServerRootCert
+	mappedRoot := caCert == "" && UsesWorkloadDomainBundles(proxy)
 
 	// These are certs being mounted from within the pod. Rather than reading directly in Envoy,
 	// which does not support rotation, we will serve them over SDS by reading the files.
@@ -191,7 +192,7 @@ func ApplyToCommonTLSContext(tlsContext *tls.CommonTlsContext, proxy *model.Prox
 	// TODO: if subjectAltName ends with *, create a prefix match as well.
 	// TODO: if user explicitly specifies SANs - should we alter his explicit config by adding all spifee aliases?
 	matchSAN := util.StringToExactMatch(subjectAltNames)
-	if len(trustDomainAliases) > 0 {
+	if !mappedRoot && len(trustDomainAliases) > 0 {
 		matchSAN = append(matchSAN, util.StringToPrefixMatch(AppendURIPrefixToTrustDomain(trustDomainAliases))...)
 	}
 
@@ -203,14 +204,21 @@ func ApplyToCommonTLSContext(tlsContext *tls.CommonTlsContext, proxy *model.Prox
 		defaultValidationContext := &tls.CertificateValidationContext{
 			MatchSubjectAltNames: matchSAN,
 		}
+		if mappedRoot {
+			ApplyMappedPeerIdentity(defaultValidationContext, subjectAltNames)
+		}
 		if crl != "" {
-			defaultValidationContext.Crl = &core.DataSource{
-				Specifier: &core.DataSource_Filename{
-					Filename: crl,
-				},
+			if mappedRoot {
+				// Mapped roots consume only the native public CRL projection,
+				// embedded by agent SDS in each selected domain's store.
+				denyMappedPeerIdentity(defaultValidationContext)
+			} else {
+				defaultValidationContext.Crl = &core.DataSource{
+					Specifier: &core.DataSource_Filename{Filename: crl},
+				}
 			}
 		}
-		if allowInsecure {
+		if allowInsecure && !mappedRoot {
 			defaultValidationContext.TrustChainVerification = tls.CertificateValidationContext_ACCEPT_UNTRUSTED
 		}
 		caRes := security.SdsCertificateConfig{

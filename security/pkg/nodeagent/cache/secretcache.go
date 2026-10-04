@@ -118,7 +118,8 @@ type SecretManagerClient struct {
 	queue queue.Delayed
 	stop  chan struct{}
 
-	caRootPath string
+	caRootPath    string
+	domainBundles *workloadDomainBundles
 }
 
 type secretCache struct {
@@ -187,6 +188,10 @@ func NewSecretManagerClient(caClient security.Client, options *security.Options)
 		stop:        make(chan struct{}),
 		caRootPath:  options.CARootPath,
 	}
+	if err := ret.initializeDomainBundles(); err != nil {
+		_ = watcher.Close()
+		return nil, err
+	}
 
 	go ret.queue.Run(ret.stop)
 	go ret.handleFileWatch()
@@ -248,6 +253,9 @@ func (sc *SecretManagerClient) getCachedSecret(resourceName string) (secret *sec
 // GenerateSecret passes the cached secret to SDS.StreamSecrets and SDS.FetchSecret.
 func (sc *SecretManagerClient) GenerateSecret(resourceName string) (secret *security.SecretItem, err error) {
 	cacheLog.Debugf("generate secret %q", resourceName)
+	if resourceName == security.RootCertReqResourceName && sc.domainBundles != nil {
+		return sc.domainBundleSecret(), nil
+	}
 	// Setup the call to store generated secret to disk
 	defer func() {
 		if secret == nil || err != nil {
@@ -905,8 +913,11 @@ func (sc *SecretManagerClient) handleFileWatch() {
 				return
 			}
 			// We only care about updates that change the file content
-			if !(isWrite(event) || isRemove(event) || isCreate(event) || event.Op&fsnotify.Chmod != 0) {
+			if !(isWrite(event) || isRemove(event) || isCreate(event) || event.Op&(fsnotify.Chmod|fsnotify.Rename) != 0) {
 				continue
+			}
+			if sc.domainBundleFileEvent(event) {
+				sc.OnSecretUpdate(security.RootCertReqResourceName)
 			}
 			sc.certMutex.RLock()
 			resources := make(map[FileCert]struct{})
@@ -928,6 +939,11 @@ func (sc *SecretManagerClient) handleFileWatch() {
 			}
 			numFileWatcherFailures.Increment()
 			cacheLog.Errorf("certificate watch error: %v", err)
+			if sc.domainBundles != nil {
+				// A failed watcher cannot justify retaining old mapped authority.
+				sc.denyDomainBundles()
+				sc.OnSecretUpdate(security.RootCertReqResourceName)
+			}
 		}
 	}
 }

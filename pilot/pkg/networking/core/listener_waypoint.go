@@ -316,6 +316,11 @@ func (lb *ListenerBuilder) buildHCMConnectTerminateChain(routes []*route.Route) 
 func (lb *ListenerBuilder) buildConnectTerminateListener(routes []*route.Route) *listener.Listener {
 	actualWildcard, _ := getWildcardsAndLocalHost(lb.node.GetIPMode())
 	bind := actualWildcard
+	tlsContext := &tls.DownstreamTlsContext{
+		CommonTlsContext:         buildCommonConnectTLSContext(lb.node, lb.push),
+		RequireClientCertificate: &wrappers.BoolValue{Value: true},
+	}
+	security.DisableMappedDownstreamResumption(lb.node, tlsContext)
 
 	l := &listener.Listener{
 		Name:    ConnectTerminate,
@@ -324,11 +329,8 @@ func (lb *ListenerBuilder) buildConnectTerminateListener(routes []*route.Route) 
 			{
 				Name: "default",
 				TransportSocket: &core.TransportSocket{
-					Name: "tls",
-					ConfigType: &core.TransportSocket_TypedConfig{TypedConfig: protoconv.MessageToAny(&tls.DownstreamTlsContext{
-						CommonTlsContext:         buildCommonConnectTLSContext(lb.node, lb.push),
-						RequireClientCertificate: &wrappers.BoolValue{Value: true},
-					})},
+					Name:       "tls",
+					ConfigType: &core.TransportSocket_TypedConfig{TypedConfig: protoconv.MessageToAny(tlsContext)},
 				},
 				Filters: lb.buildHCMConnectTerminateChain(routes),
 			},
@@ -1327,7 +1329,7 @@ func buildCommonConnectTLSContext(proxy *model.Proxy, push *model.PushContext) *
 	security.ApplyToCommonTLSContext(ctx, proxy, nil, "", nil, true, nil, false)
 	aliases := authn.TrustDomainsForValidation(push.Mesh)
 	validationCtx := ctx.GetCombinedValidationContext().DefaultValidationContext
-	if len(aliases) > 0 {
+	if !security.UsesWorkloadDomainBundles(proxy) && len(aliases) > 0 {
 		matchers := util.StringToPrefixMatch(security.AppendURIPrefixToTrustDomain(aliases))
 		for _, matcher := range matchers {
 			validationCtx.MatchTypedSubjectAltNames = append(validationCtx.MatchTypedSubjectAltNames, &tls.SubjectAltNameMatcher{

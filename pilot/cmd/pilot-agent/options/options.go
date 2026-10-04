@@ -73,6 +73,9 @@ var (
 	trustDomainEnv = env.Register("TRUST_DOMAIN", "cluster.local",
 		"The trust domain for spiffe certificates").Get()
 
+	spiffeBundleMapPath = env.Register(security.SPIFFEBundleMapPathEnv, "",
+		"Full path of the standard SPIFFE workload bundle map; names files never authorize roots.").Get()
+
 	secretTTLEnv = env.Register("SECRET_TTL", 24*time.Hour,
 		"The cert lifetime requested by istio agent").Get()
 

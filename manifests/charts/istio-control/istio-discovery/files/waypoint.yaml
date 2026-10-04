@@ -255,6 +255,14 @@ spec:
 {{- toYaml .Values.gateways.seccompProfile | nindent 12 }}
 {{- end }}
         volumeMounts:
+        {{- with (index .ProxyConfig.ProxyMetadata "SPIFFE_BUNDLE_MAP_PATH") }}
+        - name: istio-trust-domains
+          mountPath: {{ directory . | quote }}
+          readOnly: true
+        - name: istio-ca-crl
+          mountPath: /var/run/secrets/istio/crl
+          readOnly: true
+        {{- end }}
         - mountPath: /var/run/secrets/workload-spiffe-uds
           name: workload-socket
         - mountPath: /var/run/secrets/istio
@@ -268,6 +276,19 @@ spec:
         - mountPath: /etc/istio/pod
           name: istio-podinfo
       volumes:
+      {{- with (index .ProxyConfig.ProxyMetadata "SPIFFE_BUNDLE_MAP_PATH") }}
+      - name: istio-trust-domains
+        configMap:
+          name: istio-trust-domains
+          optional: true
+          items:
+          - key: spiffe-bundle-map.json
+            path: {{ base . | quote }}
+      - name: istio-ca-crl
+        configMap:
+          name: {{ $.Values.pilot.crlConfigMapName | default "istio-ca-crl" }}
+          optional: true
+      {{- end }}
       - emptyDir:
         name: workload-socket
       - emptyDir:
@@ -405,4 +426,3 @@ spec:
   selector:
     matchLabels:
       gateway.networking.k8s.io/gateway-name: {{.Name|quote}}
-
