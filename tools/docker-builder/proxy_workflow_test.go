@@ -98,7 +98,7 @@ func TestNativeProxyWorkflowTransport(t *testing.T) {
 			t.Fatal("native build must use main")
 		}
 	}
-	platforms := map[string]string{"amd64": "ubuntu-24.04/x86_64", "arm64": "ubuntu-24.04-arm/aarch64"}
+	platforms := map[string]string{"amd64": "ubuntu-22.04/x86_64", "arm64": "ubuntu-24.04-arm/aarch64"}
 	for _, row := range workflow.Jobs["proxy"].Strategy.Matrix.Include {
 		if platforms[row.Arch] != row.Runner+"/"+row.Machine {
 			t.Fatal("proxy job must use the matching native runner")
