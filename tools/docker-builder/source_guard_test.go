@@ -97,6 +97,8 @@ func TestNativeOCISourceGuard(t *testing.T) {
 			env := append(os.Environ(), "GIT_CONFIG_NOSYSTEM=1", "GIT_CONFIG_GLOBAL=/dev/null",
 				"GITHUB_WORKSPACE="+workspace, "BUILD_ZTUNNEL_REPO="+companion,
 				"RUNNER_TEMP="+workspace, "OCI_BUILDER=synthetic-builder",
+				"DEBUG_IMAGE=external", "ISTIO_ENVOY_LINUX_RELEASE_PATH=/external/amd64",
+				"ISTIO_ENVOY_LINUX_DEBUG_PATH=/external/debug",
 				"FIXTURE_MODE="+mode, "FIXTURE_LOG="+marker)
 			write := func(path, data string, mode os.FileMode) {
 				t.Helper()
@@ -133,6 +135,9 @@ func TestNativeOCISourceGuard(t *testing.T) {
 			write(filepath.Join(istio, "istio.deps"), string(deps), 0o600)
 			write(filepath.Join(istio, "tools/docker"), `#!/bin/bash
 set -euo pipefail
+test ! -v DEBUG_IMAGE
+test ! -v ISTIO_ENVOY_LINUX_RELEASE_PATH
+test ! -v ISTIO_ENVOY_LINUX_DEBUG_PATH
 printf 'build\n' >> "$FIXTURE_LOG"
 case "$FIXTURE_MODE" in
   failed-build) exit 7 ;;

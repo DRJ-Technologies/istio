@@ -1,6 +1,6 @@
 name: Native OCI build
 
-on:
+'on':
   workflow_dispatch:
     inputs:
       artifact_tag:
@@ -12,7 +12,96 @@ permissions:
   contents: read
 
 jobs:
+  proxy:
+    if: github.ref == 'refs/heads/main'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+            machine: x86_64
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+            machine: aarch64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 360
+    defaults:
+      run:
+        working-directory: proxy
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ github.sha }}
+          path: istio
+          persist-credentials: false
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          repository: DRJ-Technologies/proxy
+          ref: main
+          path: proxy
+          persist-credentials: false
+      - name: Prepare disposable proxy runner storage
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Native hosted runners provide Bazelisk. The checkout's .bazelversion
+          # selects Bazel; WORKSPACE retains its hermetic LLVM and sysroots.
+          command -v bazelisk
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc
+          mkdir -p "$RUNNER_TEMP/proxy-tmp" "$RUNNER_TEMP/proxy-export"
+          df -h "$GITHUB_WORKSPACE" "$RUNNER_TEMP"
+      - name: Build native release proxy
+        env:
+          PROXY_MACHINE: ${{ matrix.machine }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          check_source() {
+            local repo="$1" expected="$2" status
+            status="$(git -C "$repo" status --porcelain=v1 --untracked-files=all)"
+            printf 'Source status: %s\n%s\n' "$repo" "$status"
+            git -C "$repo" diff --stat HEAD --
+            test "$(git -C "$repo" rev-parse HEAD)" = "$expected"
+            test -z "$status"
+          }
+          expected="$(python3 -c 'import json; print(next(x["lastStableSHA"] for x in json.load(open("../istio/istio.deps")) if x["name"] == "PROXY_REPO_SHA"))')"
+          check_source ../istio "$GITHUB_SHA"
+          check_source . "$expected"
+          test "$(uname -s)" = Linux
+          test "$(uname -m)" = "$PROXY_MACHINE"
+          # Preserve the native version/toolchain declarations and actual Git
+          # stamps rather than accepting external replacements or RBE settings.
+          unset BUILD_SCM_REVISION BUILD_SCM_STATUS USE_BAZEL_VERSION USE_BAZEL_FALLBACK_VERSION
+          unset BAZELISK_BASE_URL BAZELISK_FORMAT_URL BAZEL_LLVM_PATH BAZEL_USE_HOST_SYSROOT BAZEL_USE_LIBSTDCPP
+          export BUILD_CONFIG=release TMPDIR="$RUNNER_TEMP/proxy-tmp"
+          test "$(bazelisk --version)" = "bazel $(cat .bazelversion)"
+          startup=(--nosystem_rc --nohome_rc --output_user_root="$RUNNER_TEMP/proxy-bazel")
+          bazelisk "${startup[@]}" build --config=release --stamp --jobs=1 //:envoy_tar \
+            2>&1 | tee "$RUNNER_TEMP/native-proxy-build.log"
+          bin="$(bazelisk "${startup[@]}" info --config=release --stamp bazel-bin)"
+          test -s "$bin/envoy" && test -x "$bin/envoy"
+          test -s "$bin/envoy_tar.tar.gz"
+          check_source ../istio "$GITHUB_SHA"
+          check_source . "$expected"
+          cp "$bin/envoy" "$bin/envoy_tar.tar.gz" "$RUNNER_TEMP/proxy-export/"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: native-proxy-${{ matrix.arch }}
+          path: ${{ runner.temp }}/proxy-export/
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: native-proxy-log-${{ matrix.arch }}
+          path: ${{ runner.temp }}/native-proxy-build.log
+          if-no-files-found: ignore
+          retention-days: 7
+
   build:
+    needs: proxy
     if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-24.04
     timeout-minutes: 180
@@ -67,6 +156,14 @@ jobs:
         with:
           go-version-file: istio/go.mod
           cache: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: native-proxy-amd64
+          path: ${{ runner.temp }}/native-proxy-amd64
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: native-proxy-arm64
+          path: ${{ runner.temp }}/native-proxy-arm64
       - name: Prepare disposable hosted runner toolchain and storage
         shell: bash
         run: |
@@ -81,6 +178,40 @@ jobs:
           mkdir -p "$RUNNER_TEMP/istio-tmp" "$RUNNER_TEMP/istio-oci"
           printf 'TMPDIR=%s/istio-tmp\n' "$RUNNER_TEMP" >> "$GITHUB_ENV"
           df -h "$GITHUB_WORKSPACE" "$RUNNER_TEMP"
+      - name: Prepare matching native proxy inputs
+        shell: bash
+        run: |
+          set -euo pipefail
+          unset DEBUG_IMAGE ISTIO_ENVOY_LINUX_RELEASE_PATH ISTIO_ENVOY_LINUX_DEBUG_PATH
+          # Upload/download preserves the bytes, but not executable file modes.
+          # The native envoy_tar archive retains its executable permission.
+          for arch in amd64 arm64; do
+            artifact="$RUNNER_TEMP/native-proxy-$arch"
+            extracted="$RUNNER_TEMP/native-proxy-extracted-$arch"
+            mkdir "$extracted"
+            tar --extract --gzip --file "$artifact/envoy_tar.tar.gz" --directory "$extracted"
+            binary="$extracted/usr/local/bin/envoy"
+            test -s "$binary" && test -r "$binary" && test -x "$binary"
+            cmp "$artifact/envoy" "$binary"
+            header="$(LC_ALL=C readelf --file-header --wide "$binary")"
+            grep -Eq 'Class:[[:space:]]+ELF64' <<< "$header"
+            case "$arch" in
+              amd64) machine='Advanced Micro Devices X86-64' ;;
+              arm64) machine='AArch64' ;;
+            esac
+            grep -Eq "Machine:[[:space:]]+$machine$" <<< "$header"
+            printf '%s\n%s\n' "$arch" "$header"
+          done
+          # Validate both artifacts before initializing either architecture.
+          # The outer Makefile runs setup_env and the maintained init recipe
+          # creates the marker; never hand-create a stamp or skip Make.
+          for arch in amd64 arm64; do
+            out="$GITHUB_WORKSPACE/istio/out/linux_$arch"
+            env -u DEBUG_IMAGE BUILD_WITH_CONTAINER=0 TARGET_OS=linux TARGET_ARCH="$arch" \
+              TARGET_OUT="$out" TARGET_OUT_LINUX="$out" \
+              ISTIO_ENVOY_LINUX_RELEASE_PATH="$RUNNER_TEMP/native-proxy-extracted-$arch/usr/local/bin/envoy" \
+              make --no-print-directory "$out/istio_is_init"
+          done
       - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f
         id: builder
         with:
@@ -113,6 +244,9 @@ jobs:
           }
           check_build_sources
           unset BUILD_ZTUNNEL_TARGET BUILD_ZTUNNEL SKIP_MAKE BUILDX_NO_DEFAULT_ATTESTATIONS
+          # RunMake varies TARGET_ARCH per build; one explicit path cannot be
+          # inherited by both architectures. Consume the real per-arch init outputs.
+          unset DEBUG_IMAGE ISTIO_ENVOY_LINUX_RELEASE_PATH ISTIO_ENVOY_LINUX_DEBUG_PATH
           ./tools/docker --targets pilot,proxyv2,install-cni,ztunnel --variants distroless \
             --architectures linux/amd64,linux/arm64 \
             --oci-output-dir "$RUNNER_TEMP/istio-oci" --oci-builder "$OCI_BUILDER"
