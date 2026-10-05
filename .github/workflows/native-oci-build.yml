@@ -59,7 +59,24 @@ jobs:
           command -v bazelisk
           sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc
           mkdir -p "$RUNNER_TEMP/proxy-tmp" "$RUNNER_TEMP/proxy-export"
+          printf 'PROXY_CACHE_DIR=%s/proxy-cache\n' "$RUNNER_TEMP" >> "$GITHUB_ENV"
           df -h "$GITHUB_WORKSPACE" "$RUNNER_TEMP"
+      - name: Select native proxy cache
+        id: proxy-inputs
+        env:
+          PROXY_RUNNER: ${{ matrix.runner }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          expected="$(python3 -c 'import json; print(next(x["lastStableSHA"] for x in json.load(open("../istio/istio.deps")) if x["name"] == "PROXY_REPO_SHA"))')"
+          test "$(git rev-parse HEAD)" = "$expected"
+          printf 'cache_prefix=native-proxy-%s-%s\n' "$PROXY_RUNNER" "$expected" >> "$GITHUB_OUTPUT"
+          mkdir -p "$PROXY_CACHE_DIR/disk" "$PROXY_CACHE_DIR/repository"
+      - uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830
+        with:
+          path: ${{ env.PROXY_CACHE_DIR }}
+          key: ${{ steps.proxy-inputs.outputs.cache_prefix }}-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: ${{ steps.proxy-inputs.outputs.cache_prefix }}-
       - name: Build native release proxy
         env:
           PROXY_MACHINE: ${{ matrix.machine }}
@@ -86,14 +103,61 @@ jobs:
           export BUILD_CONFIG=release TMPDIR="$RUNNER_TEMP/proxy-tmp"
           test "$(bazelisk --version)" = "bazel $(cat .bazelversion)"
           startup=(--nosystem_rc --nohome_rc --output_user_root="$RUNNER_TEMP/proxy-bazel")
-          bazelisk "${startup[@]}" build --config=release --stamp --jobs=1 //:envoy_tar \
-            2>&1 | tee "$RUNNER_TEMP/native-proxy-build.log"
+          resources() {
+            nproc
+            free -h
+            df -h "$GITHUB_WORKSPACE" "$RUNNER_TEMP"
+          }
+          resources | tee "$RUNNER_TEMP/native-proxy-build.log"
+          # Keep upstream HOST_CPUS-1 scheduling. Stop the native client early
+          # enough to preserve completed-action caches/logs before the job cap.
+          result=0
+          timeout --signal=INT --kill-after=120s 300m \
+            bazelisk "${startup[@]}" build --config=release --stamp \
+              --disk_cache="$PROXY_CACHE_DIR/disk" --repository_cache="$PROXY_CACHE_DIR/repository" \
+              --profile="$RUNNER_TEMP/native-proxy-profile.json.gz" //:envoy_tar \
+            2>&1 | tee -a "$RUNNER_TEMP/native-proxy-build.log" || result=$?
+          resources | tee -a "$RUNNER_TEMP/native-proxy-build.log"
+          if [[ "$result" != 0 ]]; then
+            printf 'Native proxy incomplete (exit %s); no release artifact\n' "$result"
+            exit "$result"
+          fi
           bin="$(bazelisk "${startup[@]}" info --config=release --stamp bazel-bin)"
           test -s "$bin/envoy" && test -x "$bin/envoy"
           test -s "$bin/envoy_tar.tar.gz"
           check_source ../istio "$GITHUB_SHA"
           check_source . "$expected"
           cp "$bin/envoy" "$bin/envoy_tar.tar.gz" "$RUNNER_TEMP/proxy-export/"
+      - name: Check native proxy cache size
+        id: proxy-cache-size
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ ! -d "$PROXY_CACHE_DIR/disk" || ! -d "$PROXY_CACHE_DIR/repository" ]]; then
+            echo 'No native cache produced; persistence skipped'
+            exit 0
+          fi
+          # A failed/timed-out build may retain completed actions, but modified
+          # source must not write a cache under the declared source namespace.
+          expected="$(python3 -c 'import json; print(next(x["lastStableSHA"] for x in json.load(open("../istio/istio.deps")) if x["name"] == "PROXY_REPO_SHA"))')"
+          test "$(git -C ../istio rev-parse HEAD)" = "$GITHUB_SHA"
+          test "$(git rev-parse HEAD)" = "$expected"
+          test -z "$(git -C ../istio status --porcelain=v1 --untracked-files=all)"
+          test -z "$(git status --porcelain=v1 --untracked-files=all)"
+          bytes="$(du -sb "$PROXY_CACHE_DIR" | cut -f1)"
+          printf 'Native proxy cache bytes: %s (save limit 4000000000 per architecture)\n' "$bytes"
+          if (( bytes <= 4000000000 )); then
+            echo 'save=true' >> "$GITHUB_OUTPUT"
+          else
+            echo 'Cache exceeds existing allowance budget; persistence skipped'
+          fi
+      - uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830
+        if: always() && steps.proxy-cache-size.outputs.save == 'true'
+        continue-on-error: true
+        with:
+          path: ${{ env.PROXY_CACHE_DIR }}
+          key: ${{ steps.proxy-inputs.outputs.cache_prefix }}-${{ github.run_id }}-${{ github.run_attempt }}
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: native-proxy-${{ matrix.arch }}
@@ -105,7 +169,9 @@ jobs:
         if: always()
         with:
           name: native-proxy-log-${{ matrix.arch }}
-          path: ${{ runner.temp }}/native-proxy-build.log
+          path: |
+            ${{ runner.temp }}/native-proxy-build.log
+            ${{ runner.temp }}/native-proxy-profile.json.gz
           if-no-files-found: ignore
           retention-days: 7
 
