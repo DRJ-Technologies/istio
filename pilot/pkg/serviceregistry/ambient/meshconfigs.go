@@ -146,7 +146,8 @@ func remoteMeshConfigSource(client kube.Client, namespace, name string, opts krt
 		<-opts.Stop()
 		clt.ShutdownHandlers()
 	}()
-	return krt.NewSingleton(func(ctx krt.HandlerContext) *string {
+	sourceName := "RemoteMeshConfig_" + name
+	source := krt.NewSingleton(func(ctx krt.HandlerContext) *string {
 		// Subscribe before reading the cache so a concurrent event cannot be lost.
 		changed.MarkDependant(ctx)
 		cm := clt.Get(name, namespace)
@@ -158,7 +159,8 @@ func remoteMeshConfigSource(client kube.Client, namespace, name string, opts krt
 			return nil
 		}
 		return &data
-	}, opts.WithName("RemoteMeshConfig_"+name)...)
+	}, opts.WithName(sourceName)...)
+	return meshwatcher.MeshConfigSource{Singleton: source, Name: sourceName}
 }
 
 func localClusterMeshConfig(

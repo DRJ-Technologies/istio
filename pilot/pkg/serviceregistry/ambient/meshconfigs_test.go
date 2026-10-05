@@ -76,14 +76,15 @@ func TestUnreadableRemoteMeshDoesNotBlockInitialLocalFallback(t *testing.T) {
 		makeSecret(secretNamespace, "preexisting-denied", clusterCredential{"preexisting-denied-cluster", []byte("fake-config")}), metav1.CreateOptions{})
 	assert.NoError(t, err)
 	assert.EventuallyEqual(t, func() int { return len(mc.Clusters().List()) }, 1)
+	assert.EventuallyEqual(t, mc.Clusters().HasSynced, true)
 
 	// Discover the unreadable remote before releasing the local initial state.
 	localSource := krt.NewStatic(&meshwatcher.MeshConfigResource{MeshConfig: local}, false, krt.WithStop(stop))
 	configs := buildGlobalMeshConfigCollections(mc, meshwatcher.ConfigAdapter(localSource),
 		Options{ClusterID: testC, SystemNamespace: systemNS}, krt.NewOptionsBuilder(stop, "", nil))
 	assert.EventuallyEqual(t, func() bool { return denied.Load() > 0 }, true)
-	time.Sleep(50 * time.Millisecond) // Hold local initial sync while the discovered remote joins.
 	localSource.MarkSynced()
+	assert.EventuallyEqual(t, configs.ClusterMeshConfigs.HasSynced, true)
 	resolved := krt.NewSingleton(func(ctx krt.HandlerContext) *string {
 		td := configs.FetchTrustDomain(ctx, "preexisting-denied-cluster")
 		return &td
