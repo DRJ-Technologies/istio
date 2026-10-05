@@ -1,0 +1,106 @@
+name: Upstream contribution tests
+
+on:
+  push:
+    branches: [agent/istio-upstream-tests-20261005]
+
+permissions:
+  contents: read
+
+jobs:
+  native-race:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    strategy:
+      max-parallel: 1
+      fail-fast: false
+      matrix:
+        include:
+          - name: namespace-fence
+            ref: 659b1aeff3430bf1b969c197b38acf790e2a7cc5
+            package: ./pilot/pkg/serviceregistry/kube/controller
+            source: pilot/pkg/serviceregistry/kube/controller/trustdomainscontroller.go
+            filter: ^TestTrustDomains
+            regression: TestTrustDomainsControllerWatchNamespace
+          - name: remote-mesh-fallback
+            ref: e1fa2ef9c86149faaaf37818c5cb394192f45f59
+            package: ./pilot/pkg/serviceregistry/ambient
+            source: pilot/pkg/serviceregistry/ambient/meshconfigs.go
+            filter: ^(TestUnreadableRemoteMeshDoesNotBlockInitialLocalFallback|TestMulticlusterAmbientIndex_SplitHorizon.*)$
+            regression: TestUnreadableRemoteMeshDoesNotBlockInitialLocalFallback
+    env:
+      GOENV: 'off'
+      GOWORK: 'off'
+      GOTOOLCHAIN: local
+      GOMAXPROCS: '2'
+      BASE: ba0f241c13e388afab500da5aaac100b18bed8c0
+      TEST_PACKAGE: ${{ matrix.package }}
+      SOURCE_FILE: ${{ matrix.source }}
+      TEST_FILTER: ${{ matrix.filter }}
+      REGRESSION: ${{ matrix.regression }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ matrix.ref }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff
+        with:
+          go-version-file: go.mod
+          cache: false
+      - name: Verify source and native toolchain
+        env:
+          EXPECTED_HEAD: ${{ matrix.ref }}
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$EXPECTED_HEAD"
+          test -z "$(git status --porcelain)"
+          go version
+          test "$(go env GOVERSION)" = "go$(awk '$1 == "go" {print $2}' go.mod)"
+          git diff --check "$BASE" HEAD
+          mapfile -t files < <(git diff --name-only "$BASE" HEAD -- '*.go')
+          test -z "$(gofmt -l "${files[@]}")"
+          df -h .
+          free -h
+      - name: Native focused race tests
+        run: |
+          set -euo pipefail
+          go test -mod=readonly -p=1 -tags=assert -race -count=3 -timeout=10m \
+            -json -run "$TEST_FILTER" "$TEST_PACKAGE" | tee "$RUNNER_TEMP/head.jsonl"
+          python3 - <<'PY'
+          import json, os
+          from pathlib import Path
+          events = [json.loads(line) for line in Path(os.environ['RUNNER_TEMP'], 'head.jsonl').read_text().splitlines()]
+          passes = [e for e in events if e.get('Action') == 'pass' and e.get('Test') == os.environ['REGRESSION']]
+          assert len(passes) == 3, 'regression did not execute and pass three times'
+          assert not any(e.get('Action') in ('fail', 'build-fail') for e in events)
+          assert any(e.get('Action') == 'pass' and 'Test' not in e for e in events), 'no package pass'
+          PY
+      - name: Baseline must reject the regression
+        run: |
+          set -euo pipefail
+          git show "$BASE:$SOURCE_FILE" > "$SOURCE_FILE"
+          set +e
+          go test -mod=readonly -p=1 -tags=assert -race -count=3 -timeout=10m \
+            -json -run "^${REGRESSION}$" "$TEST_PACKAGE" | tee "$RUNNER_TEMP/base.jsonl"
+          result=${PIPESTATUS[0]}
+          set -e
+          test "$result" = 1
+          python3 - <<'PY'
+          import json, os
+          from pathlib import Path
+          events = [json.loads(line) for line in Path(os.environ['RUNNER_TEMP'], 'base.jsonl').read_text().splitlines()]
+          failures = [e for e in events if e.get('Action') == 'fail' and e.get('Test') == os.environ['REGRESSION']]
+          assert len(failures) == 3, 'baseline must fail the regression three times'
+          assert not any(e.get('Action') == 'build-fail' for e in events), 'compile failure is not a regression failure'
+          output = ''.join(e.get('Output', '') for e in events)
+          assert 'WARNING: DATA RACE' not in output and 'panic:' not in output, 'unexpected baseline failure'
+          print('Three expected baseline regression failures verified.')
+          PY
+      - name: Restore source and verify no generated changes
+        if: always()
+        run: |
+          set -euo pipefail
+          git restore -- "$SOURCE_FILE"
+          git diff --exit-code
+          test -z "$(git status --porcelain)"
