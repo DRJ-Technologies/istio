@@ -22,8 +22,10 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"sigs.k8s.io/yaml"
 
@@ -60,6 +62,25 @@ func proxyFixtureWrite(t *testing.T, path string, data []byte, mode os.FileMode)
 	}
 	if err := os.WriteFile(path, data, mode); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestNativeProxyJobBudgetStart(t *testing.T) {
+	root := t.TempDir()
+	output := filepath.Join(root, "env")
+	cmd := exec.Command("bash", "-c", proxyWorkflowStep(t, "proxy", "Start native proxy job budget"))
+	cmd.Env = []string{"PATH=/usr/bin:/bin", "GITHUB_ENV=" + output}
+	before := time.Now().Unix()
+	if log, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("native job clock: %v\n%s", err, log)
+	}
+	data, err := os.ReadFile(output)
+	if err != nil {
+		t.Fatal(err)
+	}
+	epoch, err := strconv.ParseInt(strings.TrimPrefix(strings.TrimSpace(string(data)), "PROXY_JOB_START_EPOCH="), 10, 64)
+	if err != nil || epoch < before || epoch > time.Now().Unix() {
+		t.Fatalf("job budget must use the actual runner start: %s %v", data, err)
 	}
 }
 
@@ -132,6 +153,7 @@ func TestNativeProxyWorkflowTransport(t *testing.T) {
 			}
 			Steps []struct {
 				Name, Uses, If  string
+				TimeoutMinutes  int `json:"timeout-minutes"`
 				With            map[string]string
 				ContinueOnError bool `json:"continue-on-error"`
 			}
@@ -166,7 +188,18 @@ func TestNativeProxyWorkflowTransport(t *testing.T) {
 		t.Fatal("missing native proxy architecture")
 	}
 	hostDependencies := false
+	if workflow.Jobs["proxy"].Steps[0].Name != "Start native proxy job budget" {
+		t.Fatal("checkout and preparation must consume the job budget")
+	}
+	finalizationMinutes := 0
 	for _, step := range workflow.Jobs["proxy"].Steps {
+		if step.Name == "Check native proxy cache size" || strings.HasPrefix(step.Uses, "actions/cache/save@") ||
+			strings.HasPrefix(step.Uses, "actions/upload-artifact@") {
+			if step.TimeoutMinutes <= 0 {
+				t.Fatal("each finalization step must have a bounded duration")
+			}
+			finalizationMinutes += step.TimeoutMinutes
+		}
 		if step.Name == "Install native proxy host dependencies" {
 			if step.If != "matrix.arch == 'amd64'" {
 				t.Fatal("x86-only QAT and LLVM host packages must remain scoped to Jammy AMD64")
@@ -186,6 +219,9 @@ func TestNativeProxyWorkflowTransport(t *testing.T) {
 				t.Fatal("cache save must be bounded, allow incomplete builds, and never authorize release")
 			}
 		}
+	}
+	if finalizationMinutes > 25 {
+		t.Fatal("cache and artifacts must fit after the native stop and shutdown grace")
 	}
 	downloads := map[string]bool{}
 	for _, step := range workflow.Jobs["build"].Steps {
@@ -210,7 +246,7 @@ func TestNativeProxyWorkflowBuild(t *testing.T) {
 		for _, mode := range []string{
 			"clean", "wrong-machine", "wrong-os", "wrong-version", "failed-build", "deadline", "missing-output",
 			"istio-head", "proxy-head", "istio-tracked", "proxy-tracked", "proxy-untracked",
-			"post-istio-tracked", "post-proxy-tracked", "post-proxy-head",
+			"post-istio-tracked", "post-proxy-tracked", "post-proxy-head", "late-start", "budget-expired", "future-clock",
 		} {
 			t.Run(machine+"/"+mode, func(t *testing.T) {
 				root := t.TempDir()
@@ -222,6 +258,7 @@ func TestNativeProxyWorkflowBuild(t *testing.T) {
 					"GIT_CONFIG_NOSYSTEM=1", "GIT_CONFIG_GLOBAL=/dev/null",
 					"PROXY_MACHINE=" + machine, "FIXTURE_MACHINE=" + machine, "FIXTURE_MODE=" + mode,
 					"FIXTURE_OUTPUTS=" + outputs, "FIXTURE_ROOT=" + root,
+					"PROXY_JOB_START_EPOCH=1700000000",
 					"BUILD_SCM_REVISION=external-revision", "BUILD_SCM_STATUS=external-status",
 					"BUILD_CONFIG=debug", "USE_BAZEL_VERSION=external-version", "USE_BAZEL_FALLBACK_VERSION=external-fallback",
 					"BAZELISK_BASE_URL=external-mirror", "BAZELISK_FORMAT_URL=external-format",
@@ -278,6 +315,27 @@ else
   [[ "$FIXTURE_MODE" == wrong-machine ]] && echo unsupported || echo "$FIXTURE_MACHINE"
 fi
 `), 0o700)
+				proxyFixtureWrite(t, filepath.Join(commands, "date"), []byte(`#!/bin/bash
+case "$FIXTURE_MODE" in
+  late-start) echo 1700000600 ;;
+  budget-expired) echo 1700019800 ;;
+  future-clock) echo 1699999999 ;;
+  *) echo 1700000000 ;;
+esac
+`), 0o700)
+				proxyFixtureWrite(t, filepath.Join(commands, "timeout"), []byte(`#!/bin/bash
+set -euo pipefail
+if [[ "$3" == 60s ]]; then exec /usr/bin/timeout "$@"; fi
+expected=19800s
+[[ "$FIXTURE_MODE" != late-start ]] || expected=19200s
+[[ "$1" == --signal=INT && "$2" == --kill-after=120s && "$3" == "$expected" ]]
+printf '%s\n' "$3" > "$FIXTURE_ROOT/deadline"
+if [[ "$FIXTURE_MODE" == deadline ]]; then
+  shift 3
+  exec /usr/bin/timeout --signal=INT --kill-after=1s 0.2s "$@"
+fi
+exec /usr/bin/timeout "$@"
+`), 0o700)
 				proxyFixtureWrite(t, filepath.Join(commands, "bazelisk"), []byte(`#!/bin/bash
 set -euo pipefail
 for name in BUILD_SCM_REVISION BUILD_SCM_STATUS USE_BAZEL_VERSION USE_BAZEL_FALLBACK_VERSION BAZELISK_BASE_URL BAZELISK_FORMAT_URL BAZEL_LLVM_PATH BAZEL_USE_HOST_SYSROOT BAZEL_USE_LIBSTDCPP; do
@@ -288,7 +346,7 @@ if [[ "$*" == --version ]]; then
   [[ "$FIXTURE_MODE" == wrong-version ]] && echo 'bazel other-version' || echo 'bazel fixture-version'
 elif [[ " $* " == *' build '* ]]; then
   printf 'build\n' >> "$FIXTURE_ROOT/operations"
-  test "$*" = "--nosystem_rc --nohome_rc --output_user_root=$RUNNER_TEMP/proxy-bazel build --config=release --stamp --disk_cache=$PROXY_CACHE_DIR/disk --repository_cache=$PROXY_CACHE_DIR/repository --profile=$RUNNER_TEMP/native-proxy-profile.json.gz //:envoy_tar"
+  test "$*" = "--nosystem_rc --nohome_rc --output_user_root=$RUNNER_TEMP/proxy-bazel build --config=release --stamp --jobs=HOST_CPUS --disk_cache=$PROXY_CACHE_DIR/disk --repository_cache=$PROXY_CACHE_DIR/repository --profile=$RUNNER_TEMP/native-proxy-profile.json.gz //:envoy_tar"
   mkdir -p "$PROXY_CACHE_DIR/disk" "$PROXY_CACHE_DIR/repository"
   printf 'completed action' > "$PROXY_CACHE_DIR/disk/completed"
   printf 'qualified repository' > "$PROXY_CACHE_DIR/repository/completed"
@@ -315,15 +373,10 @@ fi
 				if err := os.Mkdir(filepath.Join(root, "proxy-export"), 0o700); err != nil {
 					t.Fatal(err)
 				}
-				selectedScript := script
-				if mode == "deadline" {
-					selectedScript = strings.ReplaceAll(selectedScript, "300m", "0.2s")
-					selectedScript = strings.ReplaceAll(selectedScript, "120s", "1s")
-				}
-				cmd := exec.Command("bash", "-c", selectedScript)
+				cmd := exec.Command("bash", "-c", script)
 				cmd.Dir, cmd.Env = proxy, env
 				log, err := cmd.CombinedOutput()
-				if (err == nil) != (mode == "clean") {
+				if (err == nil) != (mode == "clean" || mode == "late-start") {
 					t.Fatalf("unexpected result: %v\n%s", err, log)
 				}
 				if strings.Contains(string(log), "PRIVATE_CONTENT_NOT_FOR_LOGS") {
@@ -352,12 +405,12 @@ fi
 					}
 				}
 				_, built := os.Stat(filepath.Join(root, "operations"))
-				wantBuild := mode == "clean" || mode == "failed-build" || mode == "deadline" || mode == "missing-output" || strings.HasPrefix(mode, "post-")
+				wantBuild := mode == "clean" || mode == "late-start" || mode == "failed-build" || mode == "deadline" || mode == "missing-output" || strings.HasPrefix(mode, "post-")
 				if (built == nil) != wantBuild {
 					t.Fatalf("wrong native build boundary: %v\n%s", built, log)
 				}
 				_, exported := os.Stat(filepath.Join(root, "proxy-export", "envoy"))
-				if (exported == nil) != (mode == "clean") {
+				if (exported == nil) != (mode == "clean" || mode == "late-start") {
 					t.Fatal("failed source/build reached artifact export")
 				}
 			})

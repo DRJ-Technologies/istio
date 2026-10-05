@@ -30,6 +30,12 @@ jobs:
       run:
         working-directory: proxy
     steps:
+      - name: Start native proxy job budget
+        working-directory: ${{ github.workspace }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          printf 'PROXY_JOB_START_EPOCH=%s\n' "$(date +%s)" >> "$GITHUB_ENV"
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           ref: ${{ github.sha }}
@@ -74,6 +80,8 @@ jobs:
           printf 'cache_prefix=native-proxy-%s-%s\n' "$PROXY_RUNNER" "$expected" >> "$GITHUB_OUTPUT"
           mkdir -p "$PROXY_CACHE_DIR/disk" "$PROXY_CACHE_DIR/repository"
       - uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830
+        timeout-minutes: 5
+        continue-on-error: true
         with:
           path: ${{ env.PROXY_CACHE_DIR }}
           key: ${{ steps.proxy-inputs.outputs.cache_prefix }}-${{ github.run_id }}-${{ github.run_attempt }}
@@ -110,11 +118,18 @@ jobs:
             df -h "$GITHUB_WORKSPACE" "$RUNNER_TEMP"
           }
           resources | tee "$RUNNER_TEMP/native-proxy-build.log"
-          # Keep upstream HOST_CPUS-1 scheduling. Stop the native client early
-          # enough to preserve completed-action caches/logs before the job cap.
+          # Use the standard runner's native CPU count, without oversubscribing
+          # Bazel's CPU or memory resource limits. Preparation consumes the same
+          # 330-minute budget; leave 30 minutes for shutdown and finalization.
+          remaining=$((330 * 60 - ($(date +%s) - PROXY_JOB_START_EPOCH)))
+          if (( remaining <= 0 || remaining > 330 * 60 )); then
+            echo 'Native proxy job budget unavailable; no build or release artifact'
+            exit 124
+          fi
+          printf 'Native proxy remaining build budget: %s seconds\n' "$remaining"
           result=0
-          timeout --signal=INT --kill-after=120s 300m \
-            bazelisk "${startup[@]}" build --config=release --stamp \
+          timeout --signal=INT --kill-after=120s "${remaining}s" \
+            bazelisk "${startup[@]}" build --config=release --stamp --jobs=HOST_CPUS \
               --disk_cache="$PROXY_CACHE_DIR/disk" --repository_cache="$PROXY_CACHE_DIR/repository" \
               --profile="$RUNNER_TEMP/native-proxy-profile.json.gz" //:envoy_tar \
             2>&1 | tee -a "$RUNNER_TEMP/native-proxy-build.log" || result=$?
@@ -123,7 +138,7 @@ jobs:
             printf 'Native proxy incomplete (exit %s); no release artifact\n' "$result"
             exit "$result"
           fi
-          bin="$(bazelisk "${startup[@]}" info --config=release --stamp bazel-bin)"
+          bin="$(timeout --signal=INT --kill-after=10s 60s bazelisk "${startup[@]}" info --config=release --stamp bazel-bin)"
           test -s "$bin/envoy" && test -x "$bin/envoy"
           test -s "$bin/envoy_tar.tar.gz"
           check_source ../istio "$GITHUB_SHA"
@@ -132,6 +147,7 @@ jobs:
       - name: Check native proxy cache size
         id: proxy-cache-size
         if: always()
+        timeout-minutes: 2
         shell: bash
         run: |
           set -euo pipefail
@@ -155,11 +171,13 @@ jobs:
           fi
       - uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830
         if: always() && steps.proxy-cache-size.outputs.save == 'true'
+        timeout-minutes: 8
         continue-on-error: true
         with:
           path: ${{ env.PROXY_CACHE_DIR }}
           key: ${{ steps.proxy-inputs.outputs.cache_prefix }}-${{ github.run_id }}-${{ github.run_attempt }}
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        timeout-minutes: 8
         with:
           name: native-proxy-${{ matrix.arch }}
           path: ${{ runner.temp }}/proxy-export/
@@ -168,6 +186,7 @@ jobs:
           retention-days: 7
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         if: always()
+        timeout-minutes: 5
         with:
           name: native-proxy-log-${{ matrix.arch }}
           path: |
