@@ -63,6 +63,62 @@ func proxyFixtureWrite(t *testing.T, path string, data []byte, mode os.FileMode)
 	}
 }
 
+// Exercise the real host-setup script with isolated APT commands. The fixture
+// never installs packages or invokes the compiler on the local host.
+func TestNativeProxyHostDependencies(t *testing.T) {
+	for _, mode := range []string{"complete", "update-failed", "install-failed"} {
+		t.Run(mode, func(t *testing.T) {
+			root := t.TempDir()
+			commands := filepath.Join(root, "commands")
+			proxyFixtureWrite(t, filepath.Join(commands, "sudo"), []byte("#!/bin/bash\nexec \"$@\"\n"), 0o700)
+			proxyFixtureWrite(t, filepath.Join(commands, "apt-get"), []byte(`#!/bin/bash
+set -euo pipefail
+printf '%s\n' "$*" >> "$APT_LOG"
+case "$1" in
+  update)
+    [[ "$MODE" != update-failed ]] || exit 37
+    touch "$FIXTURE/index"
+    ;;
+  install)
+    test -f "$FIXTURE/index"
+    [[ "$MODE" != install-failed ]] || exit 41
+    shift
+    for package in "$@"; do
+      case "$package" in
+        -y|--no-install-recommends) ;;
+        libtinfo5) touch "$FIXTURE/soname5" ;;
+        autoconf-archive) printf 'AC_DEFUN([AX_PTHREAD], [])\n' > "$FIXTURE/ax_pthread.m4" ;;
+        *) echo "Unexpected or unsafe APT argument: $package" >&2; exit 43 ;;
+      esac
+    done
+    ;;
+  *) exit 45 ;;
+esac
+`), 0o700)
+			cmd := exec.Command("bash", "-c", proxyWorkflowStep(t, "proxy", "Install native proxy host dependencies"))
+			cmd.Env = []string{"PATH=" + commands + ":/usr/bin:/bin", "HOME=" + root,
+				"FIXTURE=" + root, "APT_LOG=" + filepath.Join(root, "apt.log"), "MODE=" + mode}
+			output, err := cmd.CombinedOutput()
+			if (err == nil) != (mode == "complete") {
+				t.Fatalf("host setup result: %v\n%s", err, output)
+			}
+			calls, err := os.ReadFile(filepath.Join(root, "apt.log"))
+			if err != nil || !strings.HasPrefix(string(calls), "update\n") {
+				t.Fatalf("native package index must be refreshed first: %s %v", calls, err)
+			}
+			if mode == "update-failed" && strings.Contains(string(calls), "install") {
+				t.Fatal("index failure must stop before package installation")
+			}
+			for _, prerequisite := range []string{"soname5", "ax_pthread.m4"} {
+				_, err := os.Stat(filepath.Join(root, prerequisite))
+				if (err == nil) != (mode == "complete") {
+					t.Fatalf("missing host prerequisite or failed setup continued: %s %v", prerequisite, err)
+				}
+			}
+		})
+	}
+}
+
 func TestNativeProxyWorkflowTransport(t *testing.T) {
 	var workflow struct {
 		On          map[string]any
@@ -109,7 +165,17 @@ func TestNativeProxyWorkflowTransport(t *testing.T) {
 	if len(platforms) != 0 {
 		t.Fatal("missing native proxy architecture")
 	}
+	hostDependencies := false
 	for _, step := range workflow.Jobs["proxy"].Steps {
+		if step.Name == "Install native proxy host dependencies" {
+			if step.If != "matrix.arch == 'amd64'" {
+				t.Fatal("x86-only QAT and LLVM host packages must remain scoped to Jammy AMD64")
+			}
+			hostDependencies = true
+		}
+		if step.Name == "Build native release proxy" && !hostDependencies {
+			t.Fatal("native host dependencies must be installed before compilation")
+		}
 		if strings.HasPrefix(step.Uses, "actions/upload-artifact@") && step.With["name"] == "native-proxy-${{ matrix.arch }}" {
 			if step.If != "" && step.If != "success()" {
 				t.Fatal("failed proxy build must never export a binary")

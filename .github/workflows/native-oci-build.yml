@@ -41,15 +41,16 @@ jobs:
           ref: main
           path: proxy
           persist-credentials: false
-      - name: Install native LLVM host dependency
+      - name: Install native proxy host dependencies
         if: matrix.arch == 'amd64'
         shell: bash
         run: |
           set -euo pipefail
           # The pinned LLVM x86-64 release needs SONAME5. Jammy provides the
           # genuine library through signed APT; Noble only provides SONAME6.
+          # QAT's native autogen requires AX_PTHREAD from Autoconf Archive.
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends libtinfo5
+          sudo apt-get install -y --no-install-recommends libtinfo5 autoconf-archive
       - name: Prepare disposable proxy runner storage
         shell: bash
         run: |
