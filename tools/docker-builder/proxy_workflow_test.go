@@ -468,7 +468,10 @@ func TestNativeProxyDiskGCBazel(t *testing.T) {
 		t.Fatalf("selected native Bazel version: %v\n%s", err, output)
 	}
 	disk := filepath.Join(root, "cache")
-	build, err := invoke("build", "--enable_bzlmod=false", "--enable_workspace=true", "--nofetch", "--disk_cache="+disk, "//a:BUILD")
+	// Match the upstream empty-workspace test's default fetch semantics:
+	// --nofetch also blocks first-time initialization of embedded bazel_tools.
+	// This workspace declares no external repositories or product targets.
+	build, err := invoke("build", "--enable_bzlmod=false", "--enable_workspace=true", "--disk_cache="+disk, "//a:BUILD")
 	if err != nil || !strings.Contains(string(build), "0 processes") {
 		t.Fatalf("native empty-workspace zero-action build: %v\n%s", err, build)
 	}
