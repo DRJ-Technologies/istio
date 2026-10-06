@@ -112,6 +112,11 @@ jobs:
           export BUILD_CONFIG=release TMPDIR="$RUNNER_TEMP/proxy-tmp"
           test "$(bazelisk --version)" = "bazel $(cat .bazelversion)"
           startup=(--nosystem_rc --nohome_rc --output_user_root="$RUNNER_TEMP/proxy-bazel")
+          # Retain native server metadata before building, without enabling disk
+          # GC yet. Finalization needs its current log and exact server PID.
+          timeout --signal=INT --kill-after=10s 60s \
+            bazelisk "${startup[@]}" info --config=release --stamp server_log server_pid \
+            > "$RUNNER_TEMP/native-proxy-server-info.log"
           resources() {
             nproc
             free -h
@@ -120,9 +125,10 @@ jobs:
           resources | tee "$RUNNER_TEMP/native-proxy-build.log"
           # Use the standard runner's native CPU count, without oversubscribing
           # Bazel's CPU or memory resource limits. Preparation consumes the same
-          # 330-minute budget; leave 30 minutes for shutdown and finalization.
-          remaining=$((330 * 60 - ($(date +%s) - PROXY_JOB_START_EPOCH)))
-          if (( remaining <= 0 || remaining > 330 * 60 )); then
+          # 325-minute budget; reserve bounded native disk GC, server shutdown,
+          # cache persistence and uploads within the 360-minute hosted limit.
+          remaining=$((325 * 60 - ($(date +%s) - PROXY_JOB_START_EPOCH)))
+          if (( remaining <= 0 || remaining > 325 * 60 )); then
             echo 'Native proxy job budget unavailable; no build or release artifact'
             exit 124
           fi
@@ -147,13 +153,20 @@ jobs:
       - name: Check native proxy cache size
         id: proxy-cache-size
         if: always()
-        timeout-minutes: 2
+        timeout-minutes: 8
+        continue-on-error: true
         shell: bash
         run: |
           set -euo pipefail
-          if [[ ! -d "$PROXY_CACHE_DIR/disk" || ! -d "$PROXY_CACHE_DIR/repository" ]]; then
-            echo 'No native cache produced; persistence skipped'
+          # Cache failure must not replace the original build result. An absent
+          # save output also prevents persistence if this bounded step is killed.
+          skip_cache() {
+            printf 'Native cache persistence skipped: %s\n' "$1"
             exit 0
+          }
+          trap 'skip_cache "finalization command failed"' ERR
+          if [[ ! -d "$PROXY_CACHE_DIR/disk" || ! -d "$PROXY_CACHE_DIR/repository" ]]; then
+            skip_cache 'no native cache produced'
           fi
           # A failed/timed-out build may retain completed actions, but modified
           # source must not write a cache under the declared source namespace.
@@ -162,13 +175,86 @@ jobs:
           test "$(git rev-parse HEAD)" = "$expected"
           test -z "$(git -C ../istio status --porcelain=v1 --untracked-files=all)"
           test -z "$(git status --porcelain=v1 --untracked-files=all)"
-          bytes="$(du -sb "$PROXY_CACHE_DIR" | cut -f1)"
-          printf 'Native proxy cache bytes: %s (save limit 4000000000 per architecture)\n' "$bytes"
-          if (( bytes <= 4000000000 )); then
-            echo 'save=true' >> "$GITHUB_OUTPUT"
-          else
-            echo 'Cache exceeds existing allowance budget; persistence skipped'
+          unset BUILD_SCM_REVISION BUILD_SCM_STATUS USE_BAZEL_VERSION USE_BAZEL_FALLBACK_VERSION
+          unset BAZELISK_BASE_URL BAZELISK_FORMAT_URL BAZEL_LLVM_PATH BAZEL_USE_HOST_SYSROOT BAZEL_USE_LIBSTDCPP
+          export BUILD_CONFIG=release TMPDIR="$RUNNER_TEMP/proxy-tmp"
+          startup=(--nosystem_rc --nohome_rc --output_user_root="$RUNNER_TEMP/proxy-bazel")
+          server_log="$(sed -n 's/^server_log: //p' "$RUNNER_TEMP/native-proxy-server-info.log")"
+          server_pid="$(sed -n 's/^server_pid: //p' "$RUNNER_TEMP/native-proxy-server-info.log")"
+          [[ "$server_pid" =~ ^[1-9][0-9]*$ ]] || skip_cache 'native server PID unavailable'
+          test -d "/proc/$server_pid" || skip_cache 'original native server already absent'
+          allowance=4000000000
+          repository_bytes="$(timeout 30s du -sb "$PROXY_CACHE_DIR/repository" | cut -f1)"
+          [[ "$repository_bytes" =~ ^[0-9]+$ ]]
+          # Native disk GC counts file bytes, excludes gc/tmp, and does not trim
+          # repository downloads. Leave 5% of the SAME combined cap for metadata.
+          disk_budget=$((allowance - repository_bytes - allowance / 20))
+          printf 'Native repository bytes: %s; disk GC budget: %s; combined cap: %s\n' \
+            "$repository_bytes" "$disk_budget" "$allowance"
+          gc_ok=false
+          if (( disk_budget > 0 )) && [[ -f "$server_log" && -r "$server_log" ]]; then
+            # Record this file's identity and EOF BEFORE the sole GC-enabled
+            # command. The build/earlier info commands never enabled disk GC.
+            read -r log_device log_inode log_offset < <(stat -Lc '%d %i %s' "$server_log")
+            if timeout --signal=INT --kill-after=10s 60s \
+              bazelisk "${startup[@]}" info --config=release --stamp \
+                --disk_cache="$PROXY_CACHE_DIR/disk" --repository_cache="$PROXY_CACHE_DIR/repository" \
+                --experimental_disk_cache_gc_idle_delay=0s \
+                --experimental_disk_cache_gc_max_size="$disk_budget" server_log \
+                > "$RUNNER_TEMP/native-proxy-gc-info.log" && \
+              [[ "$(cat "$RUNNER_TEMP/native-proxy-gc-info.log")" == "$server_log" ]]; then
+              # A new Bazel command would interrupt idle GC. Read only its
+              # current native log, bounded to four minutes, before shutdown.
+              if python3 - "$server_log" "$log_device" "$log_inode" "$log_offset" <<'PY'
+          import os, re, sys, time
+          path, device, inode, offset = sys.argv[1], *map(int, sys.argv[2:])
+          deadline, started, pending = time.monotonic() + 240, False, b""
+          while time.monotonic() < deadline:
+              state = os.stat(path)
+              if (state.st_dev, state.st_ino) != (device, inode) or state.st_size < offset:
+                  sys.exit("Native GC log changed identity or was truncated")
+              with open(path, "rb") as log:
+                  log.seek(offset)
+                  pending += log.read()
+                  offset = log.tell()
+              lines = pending.split(b"\n")
+              pending = lines.pop()
+              for raw in lines:
+                  line = raw.decode("utf-8", errors="replace")
+                  if "Disk cache garbage collection started" in line:
+                      started = True
+                  elif started:
+                      if "Disk cache garbage collection failed" in line or "Disk cache garbage collection interrupted" in line:
+                          sys.exit("Current native disk GC failed or was interrupted")
+                      if re.search(r"Deleted \d+ of \d+ files, reclaimed .+ of .+ in .+ seconds", line):
+                          if "concurrent update detected" in line:
+                              sys.exit("Concurrent native cache update during GC")
+                          print(line)
+                          sys.exit(0)
+              time.sleep(1)
+          sys.exit("Current native disk GC completion was not observed before deadline")
+          PY
+              then
+                gc_ok=true
+              fi
+            fi
           fi
+          # Even a failed/unknown GC gets a bounded normal shutdown. Its native
+          # client interrupts remaining idle tasks; do not archive live writers.
+          if ! timeout --signal=INT --kill-after=10s 60s bazelisk "${startup[@]}" shutdown; then
+            skip_cache 'native server shutdown failed'
+          fi
+          for attempt in {1..10}; do
+            test -e "/proc/$server_pid" || break
+            sleep 1
+          done
+          test ! -e "/proc/$server_pid" || skip_cache 'native server remains present after shutdown'
+          [[ "$gc_ok" == true ]] || skip_cache 'positive disk budget/current native GC completion unavailable'
+          bytes="$(timeout 30s du -sb "$PROXY_CACHE_DIR" | cut -f1)"
+          [[ "$bytes" =~ ^[0-9]+$ ]]
+          printf 'Quiescent native proxy cache bytes: %s (save limit %s per architecture)\n' "$bytes" "$allowance"
+          (( bytes <= allowance )) || skip_cache 'whole cache exceeds existing allowance'
+          echo 'save=true' >> "$GITHUB_OUTPUT"
       - uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830
         if: always() && steps.proxy-cache-size.outputs.save == 'true'
         timeout-minutes: 8
@@ -192,6 +278,8 @@ jobs:
           path: |
             ${{ runner.temp }}/native-proxy-build.log
             ${{ runner.temp }}/native-proxy-profile.json.gz
+            ${{ runner.temp }}/native-proxy-server-info.log
+            ${{ runner.temp }}/native-proxy-gc-info.log
           if-no-files-found: ignore
           retention-days: 7
 
