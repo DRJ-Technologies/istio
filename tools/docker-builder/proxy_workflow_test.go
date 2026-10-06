@@ -429,96 +429,105 @@ func TestNativeProxyWorkflowCacheFinalization(t *testing.T) {
 		"dirty-source", "wrong-head",
 	} {
 		t.Run(mode, func(t *testing.T) {
-			root := t.TempDir()
-			commands := filepath.Join(root, "commands")
-			istio, proxy := filepath.Join(root, "istio"), filepath.Join(root, "proxy")
-			cache, serverLog := filepath.Join(root, "cache"), filepath.Join(root, "server.log")
-			output := filepath.Join(root, "cache-output")
-			server := exec.Command("/bin/sleep", "60")
-			if err := server.Start(); err != nil {
-				t.Fatal(err)
-			}
-			stopped := make(chan struct{})
-			go func() { _ = server.Wait(); close(stopped) }()
-			t.Cleanup(func() { _ = server.Process.Kill(); <-stopped })
-			repositoryBytes := "20"
-			switch mode {
-			case "repository-growth":
-				repositoryBytes = "1000000000"
-			case "repository-oversize":
-				repositoryBytes = "4000000001"
-			case "repository-no-headroom":
-				repositoryBytes = "3800000000"
-			}
-			env := []string{
-				"PATH=" + commands + ":/usr/bin:/bin", "HOME=" + root, "RUNNER_TEMP=" + root,
-				"PROXY_CACHE_DIR=" + cache, "GITHUB_OUTPUT=" + output,
-				"GIT_CONFIG_NOSYSTEM=1", "GIT_CONFIG_GLOBAL=/dev/null", "FIXTURE_MODE=" + mode,
-				"FIXTURE_ROOT=" + root, "FIXTURE_SERVER_LOG=" + serverLog,
-				"FIXTURE_SERVER_PID=" + strconv.Itoa(server.Process.Pid), "FIXTURE_REPOSITORY_BYTES=" + repositoryBytes,
-			}
-			git := func(repo string, args ...string) string {
-				t.Helper()
-				cmd := exec.Command("git", append([]string{"-C", repo}, args...)...)
-				cmd.Env = env
-				out, err := cmd.CombinedOutput()
-				if err != nil {
-					t.Fatalf("git %v: %v\n%s", args, err, out)
-				}
-				return strings.TrimSpace(string(out))
-			}
-			for _, repo := range []string{istio, proxy} {
-				proxyFixtureWrite(t, filepath.Join(repo, "source"), []byte("native input"), 0o600)
-				git(repo, "init", "--quiet")
-				git(repo, "config", "user.name", "Dan")
-				git(repo, "config", "user.email", "dan@drj.tools")
-			}
-			git(proxy, "add", ".")
-			git(proxy, "commit", "--quiet", "-m", "proxy input")
-			deps, err := json.Marshal([]map[string]string{{"name": "PROXY_REPO_SHA", "lastStableSHA": git(proxy, "rev-parse", "HEAD")}})
-			if err != nil {
-				t.Fatal(err)
-			}
-			proxyFixtureWrite(t, filepath.Join(istio, "istio.deps"), deps, 0o600)
-			git(istio, "add", ".")
-			git(istio, "commit", "--quiet", "-m", "istio input")
-			env = append(env, "GITHUB_SHA="+git(istio, "rev-parse", "HEAD"))
-			if mode == "dirty-source" {
-				proxyFixtureWrite(t, filepath.Join(proxy, "source"), []byte("changed input"), 0o600)
-			}
-			if mode == "wrong-head" {
-				git(proxy, "commit", "--quiet", "--allow-empty", "-m", "changed head")
-			}
-			for _, directory := range []string{"disk", "repository"} {
-				proxyFixtureWrite(t, filepath.Join(cache, directory, "completed"), []byte("completed native entry"), 0o600)
-			}
-			// Prior successful GC is deliberately present in EVERY fixture. It
-			// cannot satisfy current completion, even if a new summary appears.
-			proxyFixtureWrite(t, serverLog, []byte("Disk cache garbage collection started\nDeleted 1 of 2 files, reclaimed 1 MB of 2 MB in 1.00 seconds (1 files/s, 1 MB/s)\n"), 0o600)
-			if mode == "missing-log" {
-				if err := os.Remove(serverLog); err != nil {
-					t.Fatal(err)
-				}
-			}
-			info := "server_log: " + serverLog + "\nserver_pid: " + strconv.Itoa(server.Process.Pid) + "\n"
-			if mode == "unknown-server" {
-				info = "server_log: " + serverLog + "\nserver_pid: unknown\n"
-			}
-			proxyFixtureWrite(t, filepath.Join(root, "native-proxy-server-info.log"), []byte(info), 0o600)
-			proxyFixtureWrite(t, filepath.Join(commands, "du"), []byte(`#!/bin/bash
+			testNativeProxyCacheFinalization(t, mode)
+		})
+	}
+}
+
+func testNativeProxyCacheFinalization(t *testing.T, mode string) {
+	t.Helper()
+	root, proxy, env := proxyCacheFixture(t)
+	commands := filepath.Join(root, "commands")
+	istio := filepath.Join(root, "istio")
+	cache, serverLog := filepath.Join(root, "cache"), filepath.Join(root, "server.log")
+	output := filepath.Join(root, "output")
+	server := exec.Command("/bin/sleep", "60")
+	if err := server.Start(); err != nil {
+		t.Fatal(err)
+	}
+	stopped := make(chan struct{})
+	go func() { _ = server.Wait(); close(stopped) }()
+	t.Cleanup(func() { _ = server.Process.Kill(); <-stopped })
+	repositoryBytes := "20"
+	switch mode {
+	case "repository-growth":
+		repositoryBytes = "1000000000"
+	case "repository-oversize":
+		repositoryBytes = "4000000001"
+	case "repository-no-headroom":
+		repositoryBytes = "3800000000"
+	}
+	env = append(env,
+		"PATH="+commands+":/usr/bin:/bin", "FIXTURE_MODE="+mode,
+		"FIXTURE_ROOT="+root, "FIXTURE_SERVER_LOG="+serverLog,
+		"FIXTURE_SERVER_PID="+strconv.Itoa(server.Process.Pid), "FIXTURE_REPOSITORY_BYTES="+repositoryBytes,
+	)
+	if mode == "dirty-proxy" || mode == "dirty-istio" {
+		proxyFixtureWrite(t, filepath.Join(root, strings.TrimPrefix(mode, "dirty-"), "new-source"), []byte("untracked input"), 0o600)
+	}
+	if mode == "wrong-istio-head" || mode == "wrong-proxy-head" || mode == "wrong-head" {
+		repo := proxy
+		if mode == "wrong-istio-head" {
+			repo = istio
+		}
+		cmd := exec.Command("git", "-C", repo, "commit", "--quiet", "--allow-empty", "-m", "changed head")
+		cmd.Env = env
+		if log, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("fixture changed head: %v\n%s", err, log)
+		}
+	}
+	if mode == "dirty-source" {
+		proxyFixtureWrite(t, filepath.Join(proxy, "source"), []byte("changed input"), 0o600)
+	}
+	for _, directory := range []string{"disk", "repository"} {
+		if mode == "absent" || (mode == "incomplete-directory" && directory == "repository") {
+			continue
+		}
+		proxyFixtureWrite(t, filepath.Join(cache, directory, "completed"), []byte("completed native entry"), 0o600)
+	}
+	if mode == "oversized" {
+		// Preserve real native du coverage with a sparse blob, never a
+		// multi-gigabyte allocation or real cache collection/upload.
+		file, err := os.OpenFile(filepath.Join(cache, "disk", "sparse"), os.O_CREATE|os.O_WRONLY, 0o600)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := file.Truncate(4_000_000_001); err != nil {
+			t.Fatal(err)
+		}
+		if err := file.Close(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Prior successful GC is deliberately present in EVERY fixture. It
+	// cannot satisfy current completion, even if a new summary appears.
+	proxyFixtureWrite(t, serverLog, []byte("Disk cache garbage collection started\nDeleted 1 of 2 files, reclaimed 1 MB of 2 MB in 1.00 seconds (1 files/s, 1 MB/s)\n"), 0o600)
+	if mode == "missing-log" {
+		if err := os.Remove(serverLog); err != nil {
+			t.Fatal(err)
+		}
+	}
+	info := "server_log: " + serverLog + "\nserver_pid: " + strconv.Itoa(server.Process.Pid) + "\n"
+	if mode == "unknown-server" {
+		info = "server_log: " + serverLog + "\nserver_pid: unknown\n"
+	}
+	proxyFixtureWrite(t, filepath.Join(root, "native-proxy-server-info.log"), []byte(info), 0o600)
+	proxyFixtureWrite(t, filepath.Join(commands, "du"), []byte(`#!/bin/bash
 set -euo pipefail
 if [[ "$2" == "$PROXY_CACHE_DIR/repository" ]]; then
+  if [[ "$FIXTURE_MODE" == fits || "$FIXTURE_MODE" == oversized ]]; then exec /usr/bin/du "$@"; fi
   printf '%s\t%s\n' "$FIXTURE_REPOSITORY_BYTES" "$2"
 else
   printf 'size\n' >> "$FIXTURE_ROOT/operations"
   test ! -e "/proc/$FIXTURE_SERVER_PID"
+  if [[ "$FIXTURE_MODE" == fits || "$FIXTURE_MODE" == oversized ]]; then exec /usr/bin/du "$@"; fi
   [[ "$FIXTURE_MODE" != size-failed ]] || exit 17
   bytes=100
   [[ "$FIXTURE_MODE" != whole-cache-oversize ]] || bytes=4000000001
   printf '%s\t%s\n' "$bytes" "$2"
 fi
 `), 0o700)
-			proxyFixtureWrite(t, filepath.Join(commands, "timeout"), []byte(`#!/bin/bash
+	proxyFixtureWrite(t, filepath.Join(commands, "timeout"), []byte(`#!/bin/bash
 set -euo pipefail
 if [[ "$*" == *experimental_disk_cache_gc_max_size* && "$FIXTURE_MODE" == gc-info-timeout ]] ||
    [[ "$*" == *shutdown && "$FIXTURE_MODE" == shutdown-timeout ]]; then
@@ -526,10 +535,10 @@ if [[ "$*" == *experimental_disk_cache_gc_max_size* && "$FIXTURE_MODE" == gc-inf
 fi
 exec /usr/bin/timeout "$@"
 `), 0o700)
-			proxyFixtureWrite(t, filepath.Join(commands, "sleep"), []byte("#!/bin/bash\nexec /bin/sleep 0.01\n"), 0o700)
-			// Advance only the fixture clock while executing the UNCHANGED
-			// production Python log observer, keeping timeout cases inexpensive.
-			proxyFixtureWrite(t, filepath.Join(commands, "python3"), []byte(`#!/bin/bash
+	proxyFixtureWrite(t, filepath.Join(commands, "sleep"), []byte("#!/bin/bash\nexec /bin/sleep 0.01\n"), 0o700)
+	// Advance only the fixture clock while executing the UNCHANGED
+	// production Python log observer, keeping timeout cases inexpensive.
+	proxyFixtureWrite(t, filepath.Join(commands, "python3"), []byte(`#!/bin/bash
 set -euo pipefail
 if [[ "$1" == - && "$2" == "$FIXTURE_SERVER_LOG" ]]; then
   shift
@@ -547,7 +556,7 @@ exec(compile(sys.stdin.read(), "native-GC-observer", "exec"))
 fi
 exec /usr/bin/python3 "$@"
 `), 0o700)
-			proxyFixtureWrite(t, filepath.Join(commands, "bazelisk"), []byte(`#!/bin/bash
+	proxyFixtureWrite(t, filepath.Join(commands, "bazelisk"), []byte(`#!/bin/bash
 set -euo pipefail
 test "$1" = --nosystem_rc && test "$2" = --nohome_rc
 test "$3" = "--output_user_root=$RUNNER_TEMP/proxy-bazel"
@@ -595,39 +604,47 @@ esac
 [[ "$FIXTURE_MODE" != gc-info-mismatch ]] || { echo /another/server.log; exit 0; }
 echo "$FIXTURE_SERVER_LOG"
 `), 0o700)
-			cmd := exec.Command("bash", "-c", proxyWorkflowStep(t, "proxy", "Check native proxy cache size"))
-			cmd.Dir, cmd.Env = proxy, env
-			log, err := cmd.CombinedOutput()
-			if err != nil {
-				t.Fatalf("cache finalization must preserve the prior build outcome: %v\n%s", err, log)
-			}
-			data, readErr := os.ReadFile(output)
-			wantSave := mode == "complete" || mode == "repository-growth"
-			if (readErr == nil && strings.Contains(string(data), "save=true")) != wantSave {
-				t.Fatalf("wrong cache save boundary: %s %v\n%s", data, readErr, log)
-			}
-			operations, _ := os.ReadFile(filepath.Join(root, "operations"))
-			if wantSave && string(operations) != "gc\nshutdown\nsize\n" {
-				t.Fatalf("cache must finish current GC and shutdown before whole-size check: %s", operations)
-			}
-			if !wantSave && strings.Contains(string(operations), "size\n") &&
-				mode != "whole-cache-oversize" && mode != "size-failed" {
-				t.Fatalf("unqualified cache reached whole-size/save check: %s", operations)
-			}
-			if mode == "repository-oversize" || mode == "repository-no-headroom" {
-				if string(operations) != "shutdown\n" {
-					t.Fatalf("no disk budget must stop before native GC and still shut down: %s", operations)
-				}
-			}
-			if _, err := os.Stat(filepath.Join(root, "proxy-export", "envoy")); !os.IsNotExist(err) {
-				t.Fatal("cache finalization must never export a release binary")
-			}
-			for _, directory := range []string{"disk", "repository"} {
-				if data, err := os.ReadFile(filepath.Join(cache, directory, "completed")); err != nil || len(data) == 0 {
-					t.Fatal("synthetic finalization removed original completed entries")
-				}
-			}
-		})
+	cmd := exec.Command("bash", "-c", proxyWorkflowStep(t, "proxy", "Check native proxy cache size"))
+	cmd.Dir, cmd.Env = proxy, env
+	log, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("cache finalization must preserve the prior build outcome: %v\n%s", err, log)
+	}
+	data, readErr := os.ReadFile(output)
+	wantSave := mode == "complete" || mode == "repository-growth" || mode == "fits"
+	if (readErr == nil && strings.Contains(string(data), "save=true")) != wantSave {
+		t.Fatalf("wrong cache save boundary: %s %v\n%s", data, readErr, log)
+	}
+	if !wantSave && !strings.Contains(string(log), "persistence skipped") {
+		t.Fatalf("unqualified cache must report best-effort persistence refusal: %s", log)
+	}
+	operations, _ := os.ReadFile(filepath.Join(root, "operations"))
+	if (strings.HasPrefix(mode, "dirty-") || strings.HasPrefix(mode, "wrong-") ||
+		mode == "absent" || mode == "incomplete-directory") && len(operations) != 0 {
+		t.Fatalf("source/cache preflight refusal must precede GC, shutdown, and size checks: %s", operations)
+	}
+	if wantSave && string(operations) != "gc\nshutdown\nsize\n" {
+		t.Fatalf("cache must finish current GC and shutdown before whole-size check: %s", operations)
+	}
+	if !wantSave && strings.Contains(string(operations), "size\n") &&
+		mode != "whole-cache-oversize" && mode != "size-failed" && mode != "oversized" {
+		t.Fatalf("unqualified cache reached whole-size/save check: %s", operations)
+	}
+	if mode == "repository-oversize" || mode == "repository-no-headroom" {
+		if string(operations) != "shutdown\n" {
+			t.Fatalf("no disk budget must stop before native GC and still shut down: %s", operations)
+		}
+	}
+	if _, err := os.Stat(filepath.Join(root, "proxy-export", "envoy")); !os.IsNotExist(err) {
+		t.Fatal("cache finalization must never export a release binary")
+	}
+	for _, directory := range []string{"disk", "repository"} {
+		if mode == "absent" || (mode == "incomplete-directory" && directory == "repository") {
+			continue
+		}
+		if data, err := os.ReadFile(filepath.Join(cache, directory, "completed")); err != nil || len(data) == 0 {
+			t.Fatal("synthetic finalization removed original completed entries")
+		}
 	}
 }
 
