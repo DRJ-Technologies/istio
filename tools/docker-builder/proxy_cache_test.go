@@ -103,50 +103,7 @@ func TestNativeProxyCacheSelection(t *testing.T) {
 func TestNativeProxyCacheBudget(t *testing.T) {
 	for _, mode := range []string{"fits", "oversized", "absent", "incomplete-directory", "dirty-proxy", "dirty-istio", "wrong-istio-head", "wrong-proxy-head"} {
 		t.Run(mode, func(t *testing.T) {
-			root, proxy, env := proxyCacheFixture(t)
-			for _, directory := range []string{"disk", "repository"} {
-				if mode == "absent" || (mode == "incomplete-directory" && directory == "repository") {
-					continue
-				}
-				proxyFixtureWrite(t, filepath.Join(root, "cache", directory, "native-blob"), []byte("cached action"), 0o600)
-			}
-			if mode == "oversized" {
-				// Sparse fixture: native du observes the complete cache size with
-				// no multi-gigabyte allocation or actual Bazel/cache upload.
-				file, err := os.OpenFile(filepath.Join(root, "cache", "disk", "native-blob"), os.O_WRONLY, 0)
-				if err != nil {
-					t.Fatal(err)
-				}
-				if err := file.Truncate(4_000_000_001); err != nil {
-					t.Fatal(err)
-				}
-				if err := file.Close(); err != nil {
-					t.Fatal(err)
-				}
-			}
-			if strings.HasPrefix(mode, "dirty-") {
-				proxyFixtureWrite(t, filepath.Join(root, strings.TrimPrefix(mode, "dirty-"), "new-source"), []byte("untracked input"), 0o600)
-			}
-			if mode == "wrong-istio-head" {
-				env = append(env, "GITHUB_SHA=other-source")
-			}
-			if mode == "wrong-proxy-head" {
-				proxyFixtureWrite(t, filepath.Join(root, "istio", "istio.deps"), []byte(`[{"name":"PROXY_REPO_SHA","lastStableSHA":"other-source"}]`), 0o600)
-			}
-			cmd := exec.Command("bash", "-c", proxyWorkflowStep(t, "proxy", "Check native proxy cache size"))
-			cmd.Dir, cmd.Env = proxy, env
-			log, err := cmd.CombinedOutput()
-			refused := strings.HasPrefix(mode, "dirty-") || strings.HasPrefix(mode, "wrong-")
-			if (err != nil) != refused {
-				t.Fatalf("cache/source refusal: %v\n%s", err, log)
-			}
-			output, _ := os.ReadFile(filepath.Join(root, "output"))
-			if strings.Contains(string(output), "save=true") != (mode == "fits") {
-				t.Fatalf("cache must fit before save is authorized: %s\n%s", output, log)
-			}
-			if !refused && mode != "fits" && !strings.Contains(string(log), "persistence skipped") {
-				t.Fatal("missing/oversized cache must report no persistence")
-			}
+			testNativeProxyCacheFinalization(t, mode)
 		})
 	}
 }
