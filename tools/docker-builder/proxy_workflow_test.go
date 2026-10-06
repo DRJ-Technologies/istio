@@ -424,7 +424,7 @@ fi
 func TestNativeProxyDiskGCBazel(t *testing.T) {
 	versionFile := os.Getenv("NATIVE_PROXY_GC_VERSION_FILE")
 	if versionFile == "" {
-		t.Skip("native zero-action GC fixture requires the hosted version input")
+		t.Skip("native no-spawn GC fixture requires the hosted version input")
 	}
 	version, err := os.ReadFile(versionFile)
 	if err != nil {
@@ -471,9 +471,19 @@ func TestNativeProxyDiskGCBazel(t *testing.T) {
 	// Match the upstream empty-workspace test's default fetch semantics:
 	// --nofetch also blocks first-time initialization of embedded bazel_tools.
 	// This workspace declares no external repositories or product targets.
-	build, err := invoke("build", "--enable_bzlmod=false", "--enable_workspace=true", "--disk_cache="+disk, "//a:BUILD")
-	if err != nil || !strings.Contains(string(build), "0 processes") {
-		t.Fatalf("native empty-workspace zero-action build: %v\n%s", err, build)
+	spawnLog := filepath.Join(root, "spawns.json")
+	build, err := invoke("build", "--enable_bzlmod=false", "--enable_workspace=true", "--disk_cache="+disk,
+		"--execution_log_json_file="+spawnLog, "//a:BUILD")
+	// Bazel's workspace-status metadata action returns ActionResult.EMPTY and
+	// counts as internal. An internal action is not a compiler/product spawn.
+	// Require both the actual source-file/internal-only result and the native
+	// SpawnExec log's absence of ANY spawn records, not a zero action count.
+	if err != nil || !strings.Contains(string(build), "//a:BUILD is a source file, nothing will be built for it.") ||
+		!strings.Contains(string(build), "INFO: 1 process: 1 internal.") {
+		t.Fatalf("native source-file/internal-only preparation: %v\n%s", err, build)
+	}
+	if state, err := os.Stat(spawnLog); err != nil || state.Size() != 0 {
+		t.Fatalf("native preparation must produce an empty JSON spawn log: %v\n%s", err, build)
 	}
 	info, err := invoke("info", "--enable_bzlmod=false", "--enable_workspace=true", "server_log", "server_pid")
 	if err != nil {
@@ -575,7 +585,7 @@ func TestNativeProxyDiskGCBazel(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Logf("Native four-entry GC / zero-action build:\n%s\n%s", build, observed)
+	t.Logf("Native four-entry GC / internal metadata only, zero spawn records:\n%s\n%s", build, observed)
 }
 
 // Run the real finalization script against real Git and an owned inert server
