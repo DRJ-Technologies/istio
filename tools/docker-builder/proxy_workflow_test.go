@@ -453,11 +453,6 @@ func TestNativeProxyDiskGCBazel(t *testing.T) {
 		cmd.Dir, cmd.Env = workspace, env
 		return cmd.CombinedOutput()
 	}
-	// Bazelisk may report its initial native download on stderr. Require the
-	// actual version line, while retaining diagnostics if selection fails.
-	if output, err := invoke("--version"); err != nil || !strings.HasSuffix(strings.TrimSpace(string(output)), "bazel "+strings.TrimSpace(string(version))) {
-		t.Fatalf("selected native Bazel version: %v\n%s", err, output)
-	}
 	stopped := false
 	t.Cleanup(func() {
 		if !stopped {
@@ -466,6 +461,12 @@ func TestNativeProxyDiskGCBazel(t *testing.T) {
 			}
 		}
 	})
+	// With explicit startup flags, use Bazel's native version command rather
+	// than Bazelisk's standalone --version shortcut. Register shutdown first
+	// because this command can start the owned server. Retain download stderr.
+	if output, err := invoke("version", "--gnu_format"); err != nil || !strings.HasSuffix(strings.TrimSpace(string(output)), "bazel "+strings.TrimSpace(string(version))) {
+		t.Fatalf("selected native Bazel version: %v\n%s", err, output)
+	}
 	disk := filepath.Join(root, "cache")
 	build, err := invoke("build", "--enable_bzlmod=false", "--enable_workspace=true", "--nofetch", "--disk_cache="+disk, "//a:BUILD")
 	if err != nil || !strings.Contains(string(build), "0 processes") {
