@@ -78,12 +78,16 @@ jobs:
           expected="$(python3 -c 'import json; print(next(x["lastStableSHA"] for x in json.load(open("../istio/istio.deps")) if x["name"] == "PROXY_REPO_SHA"))')"
           test "$(git rev-parse HEAD)" = "$expected"
           printf 'cache_prefix=native-proxy-%s-%s\n' "$PROXY_RUNNER" "$expected" >> "$GITHUB_OUTPUT"
-          mkdir -p "$PROXY_CACHE_DIR/disk" "$PROXY_CACHE_DIR/repository"
+          # Persist only the native disk action cache. Repository downloads stay
+          # transient on this runner, outside the saved directory.
+          mkdir -p "$PROXY_CACHE_DIR/disk" "$RUNNER_TEMP/proxy-repository"
+      # The disk-only path changes the native actions/cache version, so entries
+      # saved with the earlier combined layout are never restored.
       - uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830
         timeout-minutes: 5
         continue-on-error: true
         with:
-          path: ${{ env.PROXY_CACHE_DIR }}
+          path: ${{ env.PROXY_CACHE_DIR }}/disk
           key: ${{ steps.proxy-inputs.outputs.cache_prefix }}-${{ github.run_id }}-${{ github.run_attempt }}
           restore-keys: ${{ steps.proxy-inputs.outputs.cache_prefix }}-
       - name: Build native release proxy
@@ -136,7 +140,7 @@ jobs:
           result=0
           timeout --signal=INT --kill-after=120s "${remaining}s" \
             bazelisk "${startup[@]}" build --config=release --stamp --jobs=HOST_CPUS \
-              --disk_cache="$PROXY_CACHE_DIR/disk" --repository_cache="$PROXY_CACHE_DIR/repository" \
+              --disk_cache="$PROXY_CACHE_DIR/disk" --repository_cache="$RUNNER_TEMP/proxy-repository" \
               --profile="$RUNNER_TEMP/native-proxy-profile.json.gz" //:envoy_tar \
             2>&1 | tee -a "$RUNNER_TEMP/native-proxy-build.log" || result=$?
           resources | tee -a "$RUNNER_TEMP/native-proxy-build.log"
@@ -165,7 +169,7 @@ jobs:
             exit 0
           }
           trap 'skip_cache "finalization command failed"' ERR
-          if [[ ! -d "$PROXY_CACHE_DIR/disk" || ! -d "$PROXY_CACHE_DIR/repository" ]]; then
+          if [[ ! -d "$PROXY_CACHE_DIR/disk" || ! -d "$RUNNER_TEMP/proxy-repository" ]]; then
             skip_cache 'no native cache produced'
           fi
           # A failed/timed-out build may retain completed actions, but modified
@@ -184,13 +188,10 @@ jobs:
           [[ "$server_pid" =~ ^[1-9][0-9]*$ ]] || skip_cache 'native server PID unavailable'
           test -d "/proc/$server_pid" || skip_cache 'original native server already absent'
           allowance=4000000000
-          repository_bytes="$(timeout 30s du -sb "$PROXY_CACHE_DIR/repository" | cut -f1)"
-          [[ "$repository_bytes" =~ ^[0-9]+$ ]]
-          # Native disk GC counts file bytes, excludes gc/tmp, and does not trim
-          # repository downloads. Leave 5% of the SAME combined cap for metadata.
-          disk_budget=$((allowance - repository_bytes - allowance / 20))
-          printf 'Native repository bytes: %s; disk GC budget: %s; combined cap: %s\n' \
-            "$repository_bytes" "$disk_budget" "$allowance"
+          # Native disk GC counts file bytes and excludes gc/tmp. Only the disk
+          # cache persists; leave 5% of the SAME per-architecture cap for metadata.
+          disk_budget=$((allowance - allowance / 20))
+          printf 'Native disk GC budget: %s; persisted disk cache cap: %s\n' "$disk_budget" "$allowance"
           # One observer reads only this command's native log tail. Bazel's
           # logger can buffer idle-task records until normal server shutdown.
           cat > "$RUNNER_TEMP/native-proxy-gc-observer.py" <<'PY'
@@ -248,13 +249,13 @@ jobs:
               time.sleep(1)
           PY
           gc_possible=false
-          if (( disk_budget > 0 )) && [[ -f "$server_log" && -r "$server_log" ]]; then
+          if [[ -f "$server_log" && -r "$server_log" ]]; then
             # Record this file's identity and EOF BEFORE the sole GC-enabled
             # command. The build/earlier info commands never enabled disk GC.
             read -r log_device log_inode log_offset < <(stat -Lc '%d %i %s' "$server_log")
             if timeout --signal=INT --kill-after=10s 60s \
               bazelisk "${startup[@]}" info --config=release --stamp \
-                --disk_cache="$PROXY_CACHE_DIR/disk" --repository_cache="$PROXY_CACHE_DIR/repository" \
+                --disk_cache="$PROXY_CACHE_DIR/disk" --repository_cache="$RUNNER_TEMP/proxy-repository" \
                 --experimental_disk_cache_gc_idle_delay=0s \
                 --experimental_disk_cache_gc_max_size="$disk_budget" server_log \
                 > "$RUNNER_TEMP/native-proxy-gc-info.log" && \
@@ -282,7 +283,7 @@ jobs:
             sleep 1
           done
           test ! -e "/proc/$server_pid" || skip_cache 'native server remains present after shutdown'
-          [[ "$gc_possible" == true ]] || skip_cache 'positive disk budget/current native GC evidence refused'
+          [[ "$gc_possible" == true ]] || skip_cache 'current native GC evidence refused'
           # Re-read the ENTIRE original tail after the normal shutdown flush,
           # even if completion was visible earlier. Later interruption, failure,
           # concurrent update or log replacement must still deny persistence.
@@ -291,17 +292,17 @@ jobs:
             "$RUNNER_TEMP/native-proxy-gc-observation.log"; then
             skip_cache 'current native GC completion unavailable after shutdown'
           fi
-          bytes="$(timeout 30s du -sb "$PROXY_CACHE_DIR" | cut -f1)"
+          bytes="$(timeout 30s du -sb "$PROXY_CACHE_DIR/disk" | cut -f1)"
           [[ "$bytes" =~ ^[0-9]+$ ]]
-          printf 'Quiescent native proxy cache bytes: %s (save limit %s per architecture)\n' "$bytes" "$allowance"
-          (( bytes <= allowance )) || skip_cache 'whole cache exceeds existing allowance'
+          printf 'Quiescent native disk cache bytes: %s (save limit %s per architecture)\n' "$bytes" "$allowance"
+          (( bytes <= allowance )) || skip_cache 'whole disk cache exceeds existing allowance'
           echo 'save=true' >> "$GITHUB_OUTPUT"
       - uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830
         if: always() && steps.proxy-cache-size.outputs.save == 'true'
         timeout-minutes: 8
         continue-on-error: true
         with:
-          path: ${{ env.PROXY_CACHE_DIR }}
+          path: ${{ env.PROXY_CACHE_DIR }}/disk
           key: ${{ steps.proxy-inputs.outputs.cache_prefix }}-${{ github.run_id }}-${{ github.run_attempt }}
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         timeout-minutes: 8

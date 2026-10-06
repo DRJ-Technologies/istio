@@ -354,10 +354,10 @@ if [[ "$*" == --version ]]; then
   [[ "$FIXTURE_MODE" == wrong-version ]] && echo 'bazel other-version' || echo 'bazel fixture-version'
 elif [[ " $* " == *' build '* ]]; then
   printf 'build\n' >> "$FIXTURE_ROOT/operations"
-  test "$*" = "--nosystem_rc --nohome_rc --output_user_root=$RUNNER_TEMP/proxy-bazel build --config=release --stamp --jobs=HOST_CPUS --disk_cache=$PROXY_CACHE_DIR/disk --repository_cache=$PROXY_CACHE_DIR/repository --profile=$RUNNER_TEMP/native-proxy-profile.json.gz //:envoy_tar"
-  mkdir -p "$PROXY_CACHE_DIR/disk" "$PROXY_CACHE_DIR/repository"
+  test "$*" = "--nosystem_rc --nohome_rc --output_user_root=$RUNNER_TEMP/proxy-bazel build --config=release --stamp --jobs=HOST_CPUS --disk_cache=$PROXY_CACHE_DIR/disk --repository_cache=$RUNNER_TEMP/proxy-repository --profile=$RUNNER_TEMP/native-proxy-profile.json.gz //:envoy_tar"
+  mkdir -p "$PROXY_CACHE_DIR/disk" "$RUNNER_TEMP/proxy-repository"
   printf 'completed action' > "$PROXY_CACHE_DIR/disk/completed"
-  printf 'qualified repository' > "$PROXY_CACHE_DIR/repository/completed"
+  printf 'qualified repository' > "$RUNNER_TEMP/proxy-repository/completed"
   if [[ "$FIXTURE_MODE" == deadline ]]; then
     trap 'printf "SIGINT\n" >> "$FIXTURE_ROOT/operations"; exit 130' INT
     while :; do sleep 10; done
@@ -398,8 +398,8 @@ fi
 					if !ok || status.ExitCode() != 124 || readErr != nil || !strings.Contains(string(operations), "SIGINT") {
 						t.Fatalf("native deadline must send SIGINT and preserve incomplete exit: %v\n%s", err, log)
 					}
-					for _, directory := range []string{"disk", "repository"} {
-						if data, err := os.ReadFile(filepath.Join(root, "cache", directory, "completed")); err != nil || len(data) == 0 {
+					for _, directory := range []string{filepath.Join("cache", "disk"), "proxy-repository"} {
+						if data, err := os.ReadFile(filepath.Join(root, directory, "completed")); err != nil || len(data) == 0 {
 							t.Fatal("deadline removed completed native cache entries")
 						}
 					}
@@ -615,6 +615,7 @@ func testNativeProxyCacheFinalization(t *testing.T, mode string) {
 	commands := filepath.Join(root, "commands")
 	istio := filepath.Join(root, "istio")
 	cache, serverLog := filepath.Join(root, "cache"), filepath.Join(root, "server.log")
+	repository := filepath.Join(root, "proxy-repository")
 	output := filepath.Join(root, "output")
 	server := exec.Command("/bin/sleep", "60")
 	if err := server.Start(); err != nil {
@@ -623,19 +624,14 @@ func testNativeProxyCacheFinalization(t *testing.T, mode string) {
 	stopped := make(chan struct{})
 	go func() { _ = server.Wait(); close(stopped) }()
 	t.Cleanup(func() { _ = server.Process.Kill(); <-stopped })
-	repositoryBytes := "20"
-	switch mode {
-	case "repository-growth":
-		repositoryBytes = "1000000000"
-	case "repository-oversize":
-		repositoryBytes = "4000000001"
-	case "repository-no-headroom":
-		repositoryBytes = "3800000000"
-	}
+	// The transient repository cache is never persisted, measured or budgeted.
+	repositoryBytes := map[string]int64{
+		"repository-growth": 1_000_000_000, "repository-oversize": 4_000_000_001, "repository-no-headroom": 3_800_000_000,
+	}[mode]
 	env = append(env,
 		"PATH="+commands+":/usr/bin:/bin", "FIXTURE_MODE="+mode,
 		"FIXTURE_ROOT="+root, "FIXTURE_SERVER_LOG="+serverLog,
-		"FIXTURE_SERVER_PID="+strconv.Itoa(server.Process.Pid), "FIXTURE_REPOSITORY_BYTES="+repositoryBytes,
+		"FIXTURE_SERVER_PID="+strconv.Itoa(server.Process.Pid),
 	)
 	if mode == "dirty-proxy" || mode == "dirty-istio" {
 		proxyFixtureWrite(t, filepath.Join(root, strings.TrimPrefix(mode, "dirty-"), "new-source"), []byte("untracked input"), 0o600)
@@ -654,20 +650,27 @@ func testNativeProxyCacheFinalization(t *testing.T, mode string) {
 	if mode == "dirty-source" {
 		proxyFixtureWrite(t, filepath.Join(proxy, "source"), []byte("changed input"), 0o600)
 	}
-	for _, directory := range []string{"disk", "repository"} {
-		if mode == "absent" || (mode == "incomplete-directory" && directory == "repository") {
+	for _, directory := range []string{filepath.Join(cache, "disk"), repository} {
+		if mode == "absent" || (mode == "incomplete-directory" && directory == repository) {
 			continue
 		}
-		proxyFixtureWrite(t, filepath.Join(cache, directory, "completed"), []byte("completed native entry"), 0o600)
+		proxyFixtureWrite(t, filepath.Join(directory, "completed"), []byte("completed native entry"), 0o600)
 	}
+	sparse := map[string]int64{repository: repositoryBytes}
 	if mode == "oversized" {
+		sparse[filepath.Join(cache, "disk")] = 4_000_000_001
+	}
+	for directory, size := range sparse {
+		if size == 0 {
+			continue
+		}
 		// Preserve real native du coverage with a sparse blob, never a
 		// multi-gigabyte allocation or real cache collection/upload.
-		file, err := os.OpenFile(filepath.Join(cache, "disk", "sparse"), os.O_CREATE|os.O_WRONLY, 0o600)
+		file, err := os.OpenFile(filepath.Join(directory, "sparse"), os.O_CREATE|os.O_WRONLY, 0o600)
 		if err != nil {
 			t.Fatal(err)
 		}
-		if err := file.Truncate(4_000_000_001); err != nil {
+		if err := file.Truncate(size); err != nil {
 			t.Fatal(err)
 		}
 		if err := file.Close(); err != nil {
@@ -687,20 +690,17 @@ func testNativeProxyCacheFinalization(t *testing.T, mode string) {
 		info = "server_log: " + serverLog + "\nserver_pid: unknown\n"
 	}
 	proxyFixtureWrite(t, filepath.Join(root, "native-proxy-server-info.log"), []byte(info), 0o600)
+	// Only the persisted disk cache is ever measured.
 	proxyFixtureWrite(t, filepath.Join(commands, "du"), []byte(`#!/bin/bash
 set -euo pipefail
-if [[ "$2" == "$PROXY_CACHE_DIR/repository" ]]; then
-  if [[ "$FIXTURE_MODE" == fits || "$FIXTURE_MODE" == oversized ]]; then exec /usr/bin/du "$@"; fi
-  printf '%s\t%s\n' "$FIXTURE_REPOSITORY_BYTES" "$2"
-else
-  printf 'size\n' >> "$FIXTURE_ROOT/operations"
-  test ! -e "/proc/$FIXTURE_SERVER_PID"
-  if [[ "$FIXTURE_MODE" == fits || "$FIXTURE_MODE" == oversized ]]; then exec /usr/bin/du "$@"; fi
-  [[ "$FIXTURE_MODE" != size-failed ]] || exit 17
-  bytes=100
-  [[ "$FIXTURE_MODE" != whole-cache-oversize ]] || bytes=4000000001
-  printf '%s\t%s\n' "$bytes" "$2"
-fi
+test "$2" = "$PROXY_CACHE_DIR/disk"
+printf 'size\n' >> "$FIXTURE_ROOT/operations"
+test ! -e "/proc/$FIXTURE_SERVER_PID"
+if [[ "$FIXTURE_MODE" == fits || "$FIXTURE_MODE" == oversized || "$FIXTURE_MODE" == repository-* ]]; then exec /usr/bin/du "$@"; fi
+[[ "$FIXTURE_MODE" != size-failed ]] || exit 17
+bytes=100
+[[ "$FIXTURE_MODE" != whole-cache-oversize ]] || bytes=4000000001
+printf '%s\t%s\n' "$bytes" "$2"
 `), 0o700)
 	proxyFixtureWrite(t, filepath.Join(commands, "timeout"), []byte(`#!/bin/bash
 set -euo pipefail
@@ -782,9 +782,9 @@ for arg in "$@"; do
   case "$arg" in --experimental_disk_cache_gc_max_size=*) budget="${arg#*=}" ;; esac
 done
 [[ "$budget" =~ ^[0-9]+$ ]]
-(( budget > 0 && budget + FIXTURE_REPOSITORY_BYTES < 4000000000 ))
+(( budget == 4000000000 - 4000000000 / 20 ))
 [[ "$*" == *' --experimental_disk_cache_gc_idle_delay=0s '* ]]
-[[ "$*" == *" --disk_cache=$PROXY_CACHE_DIR/disk "* && "$*" == *" --repository_cache=$PROXY_CACHE_DIR/repository "* ]]
+[[ "$*" == *" --disk_cache=$PROXY_CACHE_DIR/disk "* && "$*" == *" --repository_cache=$RUNNER_TEMP/proxy-repository "* ]]
 [[ "$FIXTURE_MODE" != gc-info-failed ]] || exit 23
 case "$FIXTURE_MODE" in
   buffered-*) ;;
@@ -821,7 +821,7 @@ echo "$FIXTURE_SERVER_LOG"
 		t.Fatalf("cache finalization must preserve the prior build outcome: %v\n%s", err, log)
 	}
 	data, readErr := os.ReadFile(output)
-	wantSave := mode == "complete" || mode == "repository-growth" || mode == "fits" || mode == "buffered-complete"
+	wantSave := mode == "complete" || strings.HasPrefix(mode, "repository-") || mode == "fits" || mode == "buffered-complete"
 	if (readErr == nil && strings.Contains(string(data), "save=true")) != wantSave {
 		t.Fatalf("wrong cache save boundary: %s %v\n%s", data, readErr, log)
 	}
@@ -855,19 +855,14 @@ echo "$FIXTURE_SERVER_LOG"
 		mode != "whole-cache-oversize" && mode != "size-failed" && mode != "oversized" {
 		t.Fatalf("unqualified cache reached whole-size/save check: %s", operations)
 	}
-	if mode == "repository-oversize" || mode == "repository-no-headroom" {
-		if string(operations) != "shutdown\n" {
-			t.Fatalf("no disk budget must stop before native GC and still shut down: %s", operations)
-		}
-	}
 	if _, err := os.Stat(filepath.Join(root, "proxy-export", "envoy")); !os.IsNotExist(err) {
 		t.Fatal("cache finalization must never export a release binary")
 	}
-	for _, directory := range []string{"disk", "repository"} {
-		if mode == "absent" || (mode == "incomplete-directory" && directory == "repository") {
+	for _, directory := range []string{filepath.Join(cache, "disk"), repository} {
+		if mode == "absent" || (mode == "incomplete-directory" && directory == repository) {
 			continue
 		}
-		if data, err := os.ReadFile(filepath.Join(cache, directory, "completed")); err != nil || len(data) == 0 {
+		if data, err := os.ReadFile(filepath.Join(directory, "completed")); err != nil || len(data) == 0 {
 			t.Fatal("synthetic finalization removed original completed entries")
 		}
 	}
