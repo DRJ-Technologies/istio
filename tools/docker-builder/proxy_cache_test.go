@@ -90,10 +90,14 @@ func TestNativeProxyCacheSelection(t *testing.T) {
 				if err != nil || !strings.HasPrefix(string(output), "cache_prefix=native-proxy-"+runner+"-") {
 					t.Fatalf("runner/source namespace not derived: %s %v", output, err)
 				}
-				for _, directory := range []string{"disk", "repository"} {
-					if info, err := os.Stat(filepath.Join(root, "cache", directory)); err != nil || !info.IsDir() {
+				for _, directory := range []string{filepath.Join("cache", "disk"), "proxy-repository"} {
+					if info, err := os.Stat(filepath.Join(root, directory)); err != nil || !info.IsDir() {
 						t.Fatalf("native cache directory missing: %v", err)
 					}
+				}
+				// Only the disk action cache is under the persisted directory.
+				if entries, err := os.ReadDir(filepath.Join(root, "cache")); err != nil || len(entries) != 1 || entries[0].Name() != "disk" {
+					t.Fatalf("transient repository cache must stay outside the persisted cache: %v %v", entries, err)
 				}
 			})
 		}
@@ -137,9 +141,9 @@ func TestNativeProxyCacheTransport(t *testing.T) {
 		}
 	}
 	if len(cache) != 2 || cache["restore"]["key"] != cache["save"]["key"] ||
-		cache["save"]["path"] != "${{ env.PROXY_CACHE_DIR }}" || cache["restore"]["path"] != cache["save"]["path"] ||
+		cache["save"]["path"] != "${{ env.PROXY_CACHE_DIR }}/disk" || cache["restore"]["path"] != cache["save"]["path"] ||
 		!strings.Contains(cache["save"]["key"], "github.run_id") || !strings.Contains(cache["save"]["key"], "github.run_attempt") ||
 		cache["restore"]["restore-keys"] != "${{ steps.proxy-inputs.outputs.cache_prefix }}-" {
-		t.Fatal("native cache transport must use isolated derived source namespace and immutable run key")
+		t.Fatal("native cache transport must persist only the disk cache under an isolated source namespace and immutable run key")
 	}
 }
