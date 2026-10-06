@@ -16,6 +16,21 @@ jobs:
       - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff
         with:
           go-version-file: go.mod
+      - name: Select native GC test version
+        id: gc-proxy
+        run: |
+          python3 - <<'PY' >> "$GITHUB_OUTPUT"
+          import json
+          print("sha=" + next(x["lastStableSHA"] for x in json.load(open("istio.deps")) if x["name"] == "PROXY_REPO_SHA"))
+          PY
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          repository: DRJ-Technologies/proxy
+          ref: ${{ steps.gc-proxy.outputs.sha }}
+          path: native-gc-proxy
+          sparse-checkout: .bazelversion
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
       - name: Check formatting and shell syntax
         run: |
           test -z "$(gofmt -l tools/docker-builder/*.go)"
@@ -23,7 +38,15 @@ jobs:
           bash -n bin/init.sh
           git diff --check
       - name: Test native base references and companion selection
-        run: go test ./tools/docker-builder/...
+        env:
+          NATIVE_PROXY_GC_VERSION_FILE: ${{ github.workspace }}/native-gc-proxy/.bazelversion
+          EXPECTED_GC_PROXY_SHA: ${{ steps.gc-proxy.outputs.sha }}
+        run: |
+          test "$(git -C native-gc-proxy rev-parse HEAD)" = "$EXPECTED_GC_PROXY_SHA"
+          command -v bazelisk
+          # Includes four synthetic native cache entries and a zero-action file
+          # target in an empty workspace, never the proxy/product build graph.
+          go test -v ./tools/docker-builder/...
 
   domain-bundle-consumers:
     runs-on: ubuntu-latest

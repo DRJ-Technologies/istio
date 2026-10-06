@@ -191,7 +191,63 @@ jobs:
           disk_budget=$((allowance - repository_bytes - allowance / 20))
           printf 'Native repository bytes: %s; disk GC budget: %s; combined cap: %s\n' \
             "$repository_bytes" "$disk_budget" "$allowance"
-          gc_ok=false
+          # One observer reads only this command's native log tail. Bazel's
+          # logger can buffer idle-task records until normal server shutdown.
+          cat > "$RUNNER_TEMP/native-proxy-gc-observer.py" <<'PY'
+          import os, re, sys, time
+          mode, path, device, inode, offset, diagnostics = sys.argv[1:]
+          device, inode, offset = map(int, (device, inode, offset))
+          deadline, minimum_size, records = time.monotonic() + 240, offset, []
+
+          def finish(code, message):
+              # Retain only bounded GC messages, never the complete Java log.
+              with open(diagnostics, "a") as output:
+                  output.write(mode + ": " + message + "\n")
+                  output.write("\n".join(records)[-16384:] + "\n")
+              print(message)
+              sys.exit(code)
+
+          def check(state):
+              if (state.st_dev, state.st_ino) != (device, inode) or state.st_size < minimum_size:
+                  raise ValueError("Native GC log changed identity or was truncated")
+
+          while True:
+              started, completed, partial, records = False, False, False, []
+              try:
+                  check(os.stat(path))
+                  with open(path, "rb") as log:
+                      check(os.fstat(log.fileno()))
+                      log.seek(offset)
+                      for raw in log:
+                          partial = not raw.endswith(b"\n")
+                          line = raw.decode("utf-8", errors="replace")
+                          summary = re.search(r"Deleted \d+ of \d+ files, reclaimed .+ of .+ in .+ seconds", line)
+                          marker = line.find("Disk cache garbage collection ")
+                          if marker >= 0 or summary:
+                              records.append(line[marker if marker >= 0 else summary.start():].strip()[:2048])
+                              records = records[-16:]
+                          # Refusals anywhere in the fresh tail are sticky,
+                          # including records after an earlier valid summary.
+                          if "Disk cache garbage collection failed" in line or "Disk cache garbage collection interrupted" in line:
+                              raise ValueError("Current native disk GC failed or was interrupted")
+                          if "concurrent update detected" in line:
+                              raise ValueError("Concurrent native cache update during GC")
+                          if "Disk cache garbage collection started" in line:
+                              started, completed = True, False
+                          elif started and summary and not partial:
+                              completed = True
+                      minimum_size = max(minimum_size, log.tell())
+                      check(os.fstat(log.fileno()))
+                  check(os.stat(path))
+              except (OSError, ValueError) as error:
+                  finish(1, str(error))
+              if completed and not partial:
+                  finish(0, "Current native disk GC completion observed")
+              if mode == "final" or time.monotonic() >= deadline:
+                  finish(2, "Current native disk GC completion unavailable")
+              time.sleep(1)
+          PY
+          gc_possible=false
           if (( disk_budget > 0 )) && [[ -f "$server_log" && -r "$server_log" ]]; then
             # Record this file's identity and EOF BEFORE the sole GC-enabled
             # command. The build/earlier info commands never enabled disk GC.
@@ -203,39 +259,16 @@ jobs:
                 --experimental_disk_cache_gc_max_size="$disk_budget" server_log \
                 > "$RUNNER_TEMP/native-proxy-gc-info.log" && \
               [[ "$(cat "$RUNNER_TEMP/native-proxy-gc-info.log")" == "$server_log" ]]; then
-              # A new Bazel command would interrupt idle GC. Read only its
-              # current native log, bounded to four minutes, before shutdown.
-              if python3 - "$server_log" "$log_device" "$log_inode" "$log_offset" <<'PY'
-          import os, re, sys, time
-          path, device, inode, offset = sys.argv[1], *map(int, sys.argv[2:])
-          deadline, started, pending = time.monotonic() + 240, False, b""
-          while time.monotonic() < deadline:
-              state = os.stat(path)
-              if (state.st_dev, state.st_ino) != (device, inode) or state.st_size < offset:
-                  sys.exit("Native GC log changed identity or was truncated")
-              with open(path, "rb") as log:
-                  log.seek(offset)
-                  pending += log.read()
-                  offset = log.tell()
-              lines = pending.split(b"\n")
-              pending = lines.pop()
-              for raw in lines:
-                  line = raw.decode("utf-8", errors="replace")
-                  if "Disk cache garbage collection started" in line:
-                      started = True
-                  elif started:
-                      if "Disk cache garbage collection failed" in line or "Disk cache garbage collection interrupted" in line:
-                          sys.exit("Current native disk GC failed or was interrupted")
-                      if re.search(r"Deleted \d+ of \d+ files, reclaimed .+ of .+ in .+ seconds", line):
-                          if "concurrent update detected" in line:
-                              sys.exit("Concurrent native cache update during GC")
-                          print(line)
-                          sys.exit(0)
-              time.sleep(1)
-          sys.exit("Current native disk GC completion was not observed before deadline")
-          PY
-              then
-                gc_ok=true
+              gc_possible=true
+              # Read only: another Bazel command would interrupt idle GC.
+              # Exit 2 is inconclusive until shutdown flushes buffered records;
+              # an explicit refusal remains denying even if later text changes.
+              if python3 "$RUNNER_TEMP/native-proxy-gc-observer.py" wait \
+                "$server_log" "$log_device" "$log_inode" "$log_offset" \
+                "$RUNNER_TEMP/native-proxy-gc-observation.log"; then
+                :
+              else
+                [[ "$?" == 2 ]] || gc_possible=false
               fi
             fi
           fi
@@ -244,12 +277,20 @@ jobs:
           if ! timeout --signal=INT --kill-after=10s 60s bazelisk "${startup[@]}" shutdown; then
             skip_cache 'native server shutdown failed'
           fi
-          for attempt in {1..10}; do
+          for _ in {1..10}; do
             test -e "/proc/$server_pid" || break
             sleep 1
           done
           test ! -e "/proc/$server_pid" || skip_cache 'native server remains present after shutdown'
-          [[ "$gc_ok" == true ]] || skip_cache 'positive disk budget/current native GC completion unavailable'
+          [[ "$gc_possible" == true ]] || skip_cache 'positive disk budget/current native GC evidence refused'
+          # Re-read the ENTIRE original tail after the normal shutdown flush,
+          # even if completion was visible earlier. Later interruption, failure,
+          # concurrent update or log replacement must still deny persistence.
+          if ! python3 "$RUNNER_TEMP/native-proxy-gc-observer.py" final \
+            "$server_log" "$log_device" "$log_inode" "$log_offset" \
+            "$RUNNER_TEMP/native-proxy-gc-observation.log"; then
+            skip_cache 'current native GC completion unavailable after shutdown'
+          fi
           bytes="$(timeout 30s du -sb "$PROXY_CACHE_DIR" | cut -f1)"
           [[ "$bytes" =~ ^[0-9]+$ ]]
           printf 'Quiescent native proxy cache bytes: %s (save limit %s per architecture)\n' "$bytes" "$allowance"
@@ -280,6 +321,7 @@ jobs:
             ${{ runner.temp }}/native-proxy-profile.json.gz
             ${{ runner.temp }}/native-proxy-server-info.log
             ${{ runner.temp }}/native-proxy-gc-info.log
+            ${{ runner.temp }}/native-proxy-gc-observation.log
           if-no-files-found: ignore
           retention-days: 7
 

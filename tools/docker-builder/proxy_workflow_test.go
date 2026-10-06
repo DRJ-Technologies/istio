@@ -17,6 +17,7 @@ package main
 import (
 	"archive/tar"
 	"compress/gzip"
+	"context"
 	"encoding/binary"
 	"encoding/json"
 	"os"
@@ -417,6 +418,176 @@ fi
 	}
 }
 
+// Exercise Bazel's upstream disk_cache_test.sh four-entry pattern only on the
+// ordinary hosted source-test runner. The selected proxy's .bazelversion is the
+// sole version input. This empty workspace has no product/compiler targets.
+func TestNativeProxyDiskGCBazel(t *testing.T) {
+	versionFile := os.Getenv("NATIVE_PROXY_GC_VERSION_FILE")
+	if versionFile == "" {
+		t.Skip("native no-spawn GC fixture requires the hosted version input")
+	}
+	version, err := os.ReadFile(versionFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bazelisk, err := exec.LookPath("bazelisk")
+	if err != nil {
+		t.Fatal(err)
+	}
+	root := t.TempDir()
+	workspace := filepath.Join(root, "workspace")
+	for path, data := range map[string][]byte{
+		".bazelversion": version, "WORKSPACE.bazel": nil, "a/BUILD": nil,
+	} {
+		proxyFixtureWrite(t, filepath.Join(workspace, path), data, 0o600)
+	}
+	if err := os.Mkdir(filepath.Join(root, "tmp"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	env := []string{"PATH=" + os.Getenv("PATH"), "HOME=" + root, "TMPDIR=" + filepath.Join(root, "tmp")}
+	startup := []string{"--nosystem_rc", "--nohome_rc", "--noworkspace_rc", "--output_user_root=" + filepath.Join(root, "bazel")}
+	invoke := func(args ...string) ([]byte, error) {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+		defer cancel()
+		cmd := exec.CommandContext(ctx, bazelisk, append(append([]string{}, startup...), args...)...)
+		cmd.Dir, cmd.Env = workspace, env
+		return cmd.CombinedOutput()
+	}
+	stopped := false
+	t.Cleanup(func() {
+		if !stopped {
+			if output, err := invoke("shutdown"); err != nil {
+				t.Errorf("owned fixture server cleanup: %v\n%s", err, output)
+			}
+		}
+	})
+	// With explicit startup flags, use Bazel's native version command rather
+	// than Bazelisk's standalone --version shortcut. Register shutdown first
+	// because this command can start the owned server. Retain download stderr.
+	if output, err := invoke("version", "--gnu_format"); err != nil || !strings.HasSuffix(strings.TrimSpace(string(output)), "bazel "+strings.TrimSpace(string(version))) {
+		t.Fatalf("selected native Bazel version: %v\n%s", err, output)
+	}
+	disk := filepath.Join(root, "cache")
+	// Match the upstream empty-workspace test's default fetch semantics:
+	// --nofetch also blocks first-time initialization of embedded bazel_tools.
+	// This workspace declares no external repositories or product targets.
+	spawnLog := filepath.Join(root, "spawns.json")
+	build, err := invoke("build", "--enable_bzlmod=false", "--enable_workspace=true", "--disk_cache="+disk,
+		"--execution_log_json_file="+spawnLog, "//a:BUILD")
+	// Bazel's workspace-status metadata action returns ActionResult.EMPTY and
+	// counts as internal. An internal action is not a compiler/product spawn.
+	// Require both the actual source-file/internal-only result and the native
+	// SpawnExec log's absence of ANY spawn records, not a zero action count.
+	if err != nil || !strings.Contains(string(build), "//a:BUILD is a source file, nothing will be built for it.") ||
+		!strings.Contains(string(build), "INFO: 1 process: 1 internal.") {
+		t.Fatalf("native source-file/internal-only preparation: %v\n%s", err, build)
+	}
+	if state, err := os.Stat(spawnLog); err != nil || state.Size() != 0 {
+		t.Fatalf("native preparation must produce an empty JSON spawn log: %v\n%s", err, build)
+	}
+	info, err := invoke("info", "--enable_bzlmod=false", "--enable_workspace=true", "server_log", "server_pid")
+	if err != nil {
+		t.Fatalf("native server info: %v\n%s", err, info)
+	}
+	serverLog, serverPID := "", ""
+	for _, line := range strings.Split(string(info), "\n") {
+		if value, found := strings.CutPrefix(line, "server_log: "); found {
+			serverLog = value
+		}
+		if value, found := strings.CutPrefix(line, "server_pid: "); found {
+			serverPID = value
+		}
+	}
+	pid, err := strconv.Atoi(serverPID)
+	if err != nil || pid <= 0 {
+		t.Fatalf("native server PID missing: %s", info)
+	}
+	capture, err := exec.Command("stat", "-Lc", "%d %i %s", serverLog).Output()
+	if err != nil {
+		t.Fatal(err)
+	}
+	identity := strings.Fields(string(capture))
+	if len(identity) != 3 {
+		t.Fatalf("native log identity/EOF missing: %s", capture)
+	}
+	entries := []string{"cas/123", "ac/456", "cas/abc", "ac/def"}
+	for index, path := range entries {
+		path = filepath.Join(disk, path)
+		proxyFixtureWrite(t, path, make([]byte, 1<<20), 0o600)
+		mtime := time.Date(2024, 1, 1, 1, index, 0, 0, time.UTC)
+		if err := os.Chtimes(path, mtime, mtime); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Enable GC through the production command's native info path after the
+	// zero-action preparation; all four entries predate that sole GC command.
+	gcInfo, err := invoke("info", "--enable_bzlmod=false", "--enable_workspace=true",
+		"--disk_cache="+disk, "--experimental_disk_cache_gc_max_size=2M",
+		"--experimental_disk_cache_gc_idle_delay=0s", "server_log")
+	if err != nil || !strings.HasSuffix(strings.TrimSpace(string(gcInfo)), serverLog) {
+		t.Fatalf("native GC info/log binding: %v\n%s", err, gcInfo)
+	}
+	// Read only while idle GC runs: another native command would interrupt it.
+	deadline := time.Now().Add(15 * time.Second)
+	for time.Now().Before(deadline) {
+		_, first := os.Stat(filepath.Join(disk, entries[0]))
+		_, second := os.Stat(filepath.Join(disk, entries[1]))
+		if os.IsNotExist(first) && os.IsNotExist(second) {
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	// Match upstream's one-second idle grace before normal shutdown flush.
+	time.Sleep(time.Second)
+	if output, err := invoke("shutdown"); err != nil {
+		t.Fatalf("native normal shutdown: %v\n%s", err, output)
+	}
+	stopped = true
+	deadline = time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		if _, err := os.Stat("/proc/" + serverPID); os.IsNotExist(err) {
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	if _, err := os.Stat("/proc/" + serverPID); !os.IsNotExist(err) {
+		t.Fatal("original fixture server still present after shutdown")
+	}
+	for index, path := range entries {
+		state, err := os.Stat(filepath.Join(disk, path))
+		if index < 2 {
+			if !os.IsNotExist(err) {
+				t.Fatalf("old native entry was not collected: %s %v", path, err)
+			}
+		} else if err != nil || state.Size() != 1<<20 {
+			t.Fatalf("new native entry was not preserved: %s %v", path, err)
+		}
+	}
+	// Instantiate the ONE production observer, rather than a second parser.
+	script := proxyWorkflowStep(t, "proxy", "Check native proxy cache size")
+	_, observer, found := strings.Cut(script, "cat > \"$RUNNER_TEMP/native-proxy-gc-observer.py\" <<'PY'\n")
+	if !found {
+		t.Fatal("production native GC observer missing")
+	}
+	observer, _, found = strings.Cut(observer, "\nPY\n")
+	if !found {
+		t.Fatal("production native GC observer boundary missing")
+	}
+	observerFile, diagnostics := filepath.Join(root, "observer.py"), filepath.Join(root, "gc.log")
+	proxyFixtureWrite(t, observerFile, []byte(observer), 0o600)
+	cmd := exec.Command("python3", observerFile, "final", serverLog,
+		identity[0], identity[1], identity[2], diagnostics)
+	cmd.Env = env
+	if output, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("native shutdown-flushed GC observation: %v\n%s", err, output)
+	}
+	observed, err := os.ReadFile(diagnostics)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Logf("Native four-entry GC / internal metadata only, zero spawn records:\n%s\n%s", build, observed)
+}
+
 // Run the real finalization script against real Git and an owned inert server
 // process. Native log/capacity commands are synthetic; no Bazel or cache GC runs.
 func TestNativeProxyWorkflowCacheFinalization(t *testing.T) {
@@ -427,6 +598,10 @@ func TestNativeProxyWorkflowCacheFinalization(t *testing.T) {
 		"gc-info-timeout", "gc-info-mismatch", "repository-oversize", "repository-no-headroom",
 		"shutdown-failed", "shutdown-timeout", "shutdown-live", "whole-cache-oversize", "size-failed",
 		"dirty-source", "wrong-head",
+		"buffered-complete", "buffered-failed", "buffered-interrupted", "buffered-concurrent-update",
+		"buffered-stale-summary", "buffered-partial-summary", "post-complete-failed", "post-complete-interrupted",
+		"post-complete-concurrent-update", "post-complete-rotation", "post-complete-truncation", "post-complete-new-start",
+		"pre-complete-late-failed", "pre-refusal-repaired", "pre-rotation-repaired",
 	} {
 		t.Run(mode, func(t *testing.T) {
 			testNativeProxyCacheFinalization(t, mode)
@@ -540,10 +715,10 @@ exec /usr/bin/timeout "$@"
 	// production Python log observer, keeping timeout cases inexpensive.
 	proxyFixtureWrite(t, filepath.Join(commands, "python3"), []byte(`#!/bin/bash
 set -euo pipefail
-if [[ "$1" == - && "$2" == "$FIXTURE_SERVER_LOG" ]]; then
-  shift
+if [[ "$1" == "$RUNNER_TEMP/native-proxy-gc-observer.py" ]]; then
   exec /usr/bin/python3 -c '
 import sys, time
+script = sys.argv.pop(1)
 tick = 0
 def monotonic():
     global tick
@@ -551,7 +726,7 @@ def monotonic():
     return tick
 time.monotonic = monotonic
 time.sleep = lambda _: None
-exec(compile(sys.stdin.read(), "native-GC-observer", "exec"))
+exec(compile(open(script).read(), script, "exec"))
 ' "$@"
 fi
 exec /usr/bin/python3 "$@"
@@ -564,6 +739,39 @@ if [[ "$4" == shutdown ]]; then
   printf 'shutdown\n' >> "$FIXTURE_ROOT/operations"
   [[ "$FIXTURE_MODE" != shutdown-failed ]] || exit 19
   [[ "$FIXTURE_MODE" != shutdown-live ]] || exit 0
+  # Simulate records becoming visible ONLY during normal logger shutdown,
+  # and records appended after the live observer saw a valid completion.
+  case "$FIXTURE_MODE" in
+    buffered-*)
+      [[ "$FIXTURE_MODE" == buffered-stale-summary ]] || echo 'Disk cache garbage collection started' >> "$FIXTURE_SERVER_LOG"
+      case "$FIXTURE_MODE" in
+        buffered-failed) echo 'Disk cache garbage collection failed' >> "$FIXTURE_SERVER_LOG" ;;
+        buffered-interrupted) echo 'Disk cache garbage collection interrupted' >> "$FIXTURE_SERVER_LOG" ;;
+        *)
+          printf 'Deleted 1 of 2 files, reclaimed 1 MB of 2 MB in 1.00 seconds' >> "$FIXTURE_SERVER_LOG"
+          [[ "$FIXTURE_MODE" != buffered-concurrent-update ]] || printf ' (concurrent update detected)' >> "$FIXTURE_SERVER_LOG"
+          [[ "$FIXTURE_MODE" == buffered-partial-summary ]] || printf '\n' >> "$FIXTURE_SERVER_LOG"
+          ;;
+      esac
+      ;;
+    post-complete-failed) echo 'Disk cache garbage collection failed' >> "$FIXTURE_SERVER_LOG" ;;
+    post-complete-interrupted) echo 'Disk cache garbage collection interrupted' >> "$FIXTURE_SERVER_LOG" ;;
+    post-complete-concurrent-update) echo 'Deleted 1 of 2 files, reclaimed 1 MB of 2 MB in 1.00 seconds (concurrent update detected)' >> "$FIXTURE_SERVER_LOG" ;;
+    post-complete-truncation) : > "$FIXTURE_SERVER_LOG" ;;
+    post-complete-new-start) echo 'Disk cache garbage collection started' >> "$FIXTURE_SERVER_LOG" ;;
+    post-complete-rotation)
+      mv "$FIXTURE_SERVER_LOG" "$FIXTURE_SERVER_LOG.old"
+      cat "$FIXTURE_SERVER_LOG.old" > "$FIXTURE_SERVER_LOG"
+      ;;
+    pre-refusal-repaired)
+      printf 'Disk cache garbage collection started\nDeleted 1 of 2 files, reclaimed 1 MB of 2 MB in 1.00 seconds (1 files/s, 1 MB/s)\n' > "$FIXTURE_SERVER_LOG"
+      printf 'Disk cache garbage collection started\nDeleted 1 of 2 files, reclaimed 1 MB of 2 MB in 1.00 seconds\n' >> "$FIXTURE_SERVER_LOG"
+      ;;
+    pre-rotation-repaired)
+      mv -f "$FIXTURE_SERVER_LOG.old" "$FIXTURE_SERVER_LOG"
+      printf 'Disk cache garbage collection started\nDeleted 1 of 2 files, reclaimed 1 MB of 2 MB in 1.00 seconds\n' >> "$FIXTURE_SERVER_LOG"
+      ;;
+  esac
   kill -TERM "$FIXTURE_SERVER_PID"
   exit 0
 fi
@@ -579,24 +787,26 @@ done
 [[ "$*" == *" --disk_cache=$PROXY_CACHE_DIR/disk "* && "$*" == *" --repository_cache=$PROXY_CACHE_DIR/repository "* ]]
 [[ "$FIXTURE_MODE" != gc-info-failed ]] || exit 23
 case "$FIXTURE_MODE" in
+  buffered-*) ;;
   stale-only) ;;
   stale-summary)
     echo 'Deleted 1 of 2 files, reclaimed 1 MB of 2 MB in 1.00 seconds' >> "$FIXTURE_SERVER_LOG" ;;
   log-truncated) : > "$FIXTURE_SERVER_LOG" ;;
   *)
-    if [[ "$FIXTURE_MODE" == log-rotated ]]; then
+    if [[ "$FIXTURE_MODE" == log-rotated || "$FIXTURE_MODE" == pre-rotation-repaired ]]; then
       mv "$FIXTURE_SERVER_LOG" "$FIXTURE_SERVER_LOG.old"
     fi
     echo 'Disk cache garbage collection started' >> "$FIXTURE_SERVER_LOG"
     case "$FIXTURE_MODE" in
       gc-timeout) ;;
-      gc-failed) echo 'Disk cache garbage collection failed' >> "$FIXTURE_SERVER_LOG" ;;
+      gc-failed|pre-refusal-repaired) echo 'Disk cache garbage collection failed' >> "$FIXTURE_SERVER_LOG" ;;
       gc-interrupted) echo 'Disk cache garbage collection interrupted' >> "$FIXTURE_SERVER_LOG" ;;
       unknown-summary) echo 'Unknown native result' >> "$FIXTURE_SERVER_LOG" ;;
       *)
         printf 'Deleted 1 of 2 files, reclaimed 1 MB of 2 MB in 1.00 seconds (1 files/s, 1 MB/s)' >> "$FIXTURE_SERVER_LOG"
         [[ "$FIXTURE_MODE" != gc-concurrent-update ]] || printf ' (concurrent update detected)' >> "$FIXTURE_SERVER_LOG"
         printf '\n' >> "$FIXTURE_SERVER_LOG"
+        [[ "$FIXTURE_MODE" != pre-complete-late-failed ]] || echo 'Disk cache garbage collection failed' >> "$FIXTURE_SERVER_LOG"
         ;;
     esac
     ;;
@@ -611,12 +821,27 @@ echo "$FIXTURE_SERVER_LOG"
 		t.Fatalf("cache finalization must preserve the prior build outcome: %v\n%s", err, log)
 	}
 	data, readErr := os.ReadFile(output)
-	wantSave := mode == "complete" || mode == "repository-growth" || mode == "fits"
+	wantSave := mode == "complete" || mode == "repository-growth" || mode == "fits" || mode == "buffered-complete"
 	if (readErr == nil && strings.Contains(string(data), "save=true")) != wantSave {
 		t.Fatalf("wrong cache save boundary: %s %v\n%s", data, readErr, log)
 	}
 	if !wantSave && !strings.Contains(string(log), "persistence skipped") {
 		t.Fatalf("unqualified cache must report best-effort persistence refusal: %s", log)
+	}
+	if diagnostics, err := os.ReadFile(filepath.Join(root, "native-proxy-gc-observation.log")); err == nil {
+		if len(diagnostics) > 33_000 {
+			t.Fatal("native GC diagnostics exceeded their bounded artifact size")
+		}
+		if strings.HasPrefix(mode, "post-complete-") && !strings.Contains(string(diagnostics), "final:") {
+			t.Fatalf("early completion must still inspect the entire final tail: %s", diagnostics)
+		}
+		if mode == "buffered-complete" && (!strings.Contains(string(diagnostics), "wait: Current native disk GC completion unavailable") ||
+			!strings.Contains(string(diagnostics), "final: Current native disk GC completion observed") ||
+			!strings.Contains(string(diagnostics), "Deleted 1 of 2 files")) {
+			t.Fatalf("shutdown-flushed native completion diagnostics missing: %s", diagnostics)
+		}
+	} else if wantSave {
+		t.Fatalf("qualified cache must retain bounded native GC diagnostics: %v", err)
 	}
 	operations, _ := os.ReadFile(filepath.Join(root, "operations"))
 	if (strings.HasPrefix(mode, "dirty-") || strings.HasPrefix(mode, "wrong-") ||
