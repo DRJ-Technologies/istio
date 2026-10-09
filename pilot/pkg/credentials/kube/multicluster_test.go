@@ -60,6 +60,37 @@ func TestForClusterWithRemoteCredentialsDisabled(t *testing.T) {
 	}
 }
 
+// A disabled remote controller is a typed nil. The cluster's initial sync waits
+// on its HasSynced and cluster removal closes it, both through
+// multicluster.ComponentConstraint; neither may dereference it.
+func TestRemoteCredentialsDisabledComponentLifecycle(t *testing.T) {
+	test.SetForTest(t, &features.EnableRemoteCredentialsController, false)
+
+	stop := test.NewStop(t)
+	localClient := kube.NewFakeClient()
+	localClient.RunAndWait(stop)
+	remoteClient := kube.NewFakeClient()
+	remoteClient.RunAndWait(stop)
+
+	mc := multicluster.NewFakeController()
+	sc := NewMulticluster("local", mc)
+	mc.Add("local", localClient, stop)
+	mc.Add("remote", remoteClient, stop)
+
+	remote := sc.component.ForCluster("remote")
+	if remote == nil || *remote != nil {
+		t.Fatalf("expected a nil remote credentials controller, got %v", remote)
+	}
+	var constraint multicluster.ComponentConstraint = *remote
+	if !constraint.HasSynced() {
+		t.Fatal("expected the disabled remote controller to report synced")
+	}
+	mc.Delete("remote")
+	if sc.component.ForCluster("remote") != nil {
+		t.Fatal("expected the remote cluster to be removed")
+	}
+}
+
 func TestAuthorizeWithRemoteCredentialsDisabled(t *testing.T) {
 	test.SetForTest(t, &features.EnableRemoteCredentialsController, false)
 

@@ -129,14 +129,25 @@ func NewCredentialsController(kc kube.Client, handlers []func(typ kind.Kind, nam
 	}
 }
 
+// Close is a no-op for the nil controller of a remote cluster whose credentials
+// controller is disabled by PILOT_ENABLE_REMOTE_CREDENTIALS_CONTROLLER.
 func (s *CredentialsController) Close() {
+	if s == nil {
+		return
+	}
 	s.secrets.ShutdownHandlers()
 	if s.configMaps != nil {
 		s.configMaps.ShutdownHandlers()
 	}
 }
 
+// HasSynced reports the nil controller of a remote cluster whose credentials
+// controller is disabled as synced: it has nothing to sync, and the cluster's
+// initial sync waits on every component's HasSynced.
 func (s *CredentialsController) HasSynced() bool {
+	if s == nil {
+		return true
+	}
 	synced := s.secrets.HasSynced()
 	if s.configMaps != nil {
 		synced = synced && s.configMaps.HasSynced()
