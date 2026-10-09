@@ -365,12 +365,19 @@ jobs:
       - name: Select artifact tag
         env:
           INPUT_ARTIFACT_TAG: ${{ inputs.artifact_tag }}
+          PROXY_RUN_ID: ${{ inputs.proxy_run_id }}
         shell: bash
         run: |
           set -euo pipefail
           stem="${INPUT_ARTIFACT_TAG%-distroless}"
           release="${stem##*-drj.}"
-          if [[ "$INPUT_ARTIFACT_TAG" != "$VERSION-drj.$release-distroless" || ! "$release" =~ ^[1-9][0-9]*$ ]]; then
+          # A full build is drj.N; a pilot-only build is drj.N-pilot.M, beside
+          # the full drj.N proxy, CNI and ztunnel.
+          pattern='^[1-9][0-9]*$'
+          if [[ -n "$PROXY_RUN_ID" ]]; then
+            pattern='^[1-9][0-9]*-pilot\.[1-9][0-9]*$'
+          fi
+          if [[ "$INPUT_ARTIFACT_TAG" != "$VERSION-drj.$release-distroless" || ! "$release" =~ $pattern ]]; then
             echo 'Expected an immutable fork tag for the selected component version and distroless variant' >&2
             exit 1
           fi
@@ -443,13 +450,16 @@ jobs:
             exit 1
           fi
           artifacts="$(api "actions/runs/$PROXY_RUN_ID/artifacts?per_page=100")"
+          # The pilot tag names the full build it sits beside (drj.N-pilot.M
+          # beside drj.N); the referenced run must be that build.
+          beside="${INPUT_ARTIFACT_TAG%-pilot.*}-distroless"
           python3 -c '
           import json, sys
-          if any(a["name"] == "istio-oci-" + sys.argv[1] for a in json.load(sys.stdin)["artifacts"]):
-              sys.exit("artifact_tag must be new, not the referenced run'"'"'s own tag")
-          ' "$INPUT_ARTIFACT_TAG" <<< "$artifacts"
-          printf 'mode=pilot-only\nsource=%s\ntag=%s\nproxy_run=%s\nproxy_run_head=%s\nPROXY_REPO_SHA=%s\n' \
-            "$GITHUB_SHA" "$INPUT_ARTIFACT_TAG" "$PROXY_RUN_ID" "$head" "$expected" > "$RUNNER_TEMP/pilot-inputs.txt"
+          if not any(a["name"] == "istio-oci-" + sys.argv[1] for a in json.load(sys.stdin)["artifacts"]):
+              sys.exit("referenced run does not hold istio-oci-" + sys.argv[1])
+          ' "$beside" <<< "$artifacts"
+          printf 'mode=pilot-only\nsource=%s\ntag=%s\nbeside=%s\nproxy_run=%s\nproxy_run_head=%s\nPROXY_REPO_SHA=%s\n' \
+            "$GITHUB_SHA" "$INPUT_ARTIFACT_TAG" "$beside" "$PROXY_RUN_ID" "$head" "$expected" > "$RUNNER_TEMP/pilot-inputs.txt"
           for arch in amd64 arm64; do
             found="$(python3 -c '
           import json, sys

@@ -34,11 +34,11 @@ import (
 // same PROXY_REPO_SHA, with every artifact matching its recorded digest.
 func TestNativePilotOnlyProxyArtifacts(t *testing.T) {
 	script := proxyWorkflowStep(t, "build", "Download referenced native proxy artifacts")
-	const repo, runID, head, tag = "DRJ-Technologies/istio", "4242", "referenced-head", "1.31.1-drj.5-distroless"
+	const repo, runID, head, tag = "DRJ-Technologies/istio", "4242", "referenced-head", "1.31.1-drj.4-pilot.1-distroless"
 	sanitize := regexp.MustCompile(`[^A-Za-z0-9]`)
 	for _, mode := range []string{
 		"clean", "bad-run-id", "other-workflow", "other-branch", "failed-run", "other-proxy-sha",
-		"digest-mismatch", "missing-artifact", "expired-artifact", "reused-tag",
+		"digest-mismatch", "missing-artifact", "expired-artifact", "other-full-build",
 	} {
 		t.Run(mode, func(t *testing.T) {
 			root := t.TempDir()
@@ -83,8 +83,8 @@ func TestNativePilotOnlyProxyArtifacts(t *testing.T) {
 				"name": "istio-oci-1.31.1-drj.4-distroless", "id": 1, "expired": false,
 				"digest": "sha256:" + hex.EncodeToString(make([]byte, 32)),
 			}}
-			if mode == "reused-tag" {
-				artifacts[0]["name"] = "istio-oci-" + tag
+			if mode == "other-full-build" {
+				artifacts[0]["name"] = "istio-oci-1.31.1-drj.3-distroless"
 			}
 			for i, arch := range []string{"amd64", "arm64"} {
 				binaries[arch] = proxyFixtureELF(uint16(62 + i*121))
@@ -137,7 +137,7 @@ cat "$FIXTURE_API/$(printf '%s' "$path" | sed 's/[^A-Za-z0-9]/_/g')"
 			cmd.Env = []string{
 				"PATH=" + commands + ":/usr/bin:/bin", "HOME=" + root, "RUNNER_TEMP=" + root, "FIXTURE_API=" + fixtures,
 				"GH_TOKEN=fixture-token", "GITHUB_REPOSITORY=" + repo, "GITHUB_SHA=pilot-source",
-				"PROXY_RUN_ID=" + id, "INPUT_ARTIFACT_TAG=" + tag,
+				"PROXY_RUN_ID=" + id, "INPUT_ARTIFACT_TAG=" + tag, "VERSION=1.31.1",
 			}
 			log, err := cmd.CombinedOutput()
 			if (err == nil) != (mode == "clean") {
@@ -155,7 +155,7 @@ cat "$FIXTURE_API/$(printf '%s' "$path" | sed 's/[^A-Za-z0-9]/_/g')"
 				"digest-mismatch":  "native-proxy-arm64 does not match its recorded digest",
 				"missing-artifact": "expected one unexpired native-proxy-arm64 artifact",
 				"expired-artifact": "expected one unexpired native-proxy-amd64 artifact",
-				"reused-tag":       "artifact_tag must be new",
+				"other-full-build": "referenced run does not hold istio-oci-1.31.1-drj.4-distroless",
 			}
 			if mode != "clean" {
 				if !bytes.Contains(log, []byte(reasons[mode])) {
@@ -176,7 +176,8 @@ cat "$FIXTURE_API/$(printf '%s' "$path" | sed 's/[^A-Za-z0-9]/_/g')"
 			if err != nil {
 				t.Fatal(err)
 			}
-			want := regexp.MustCompile(`^mode=pilot-only\nsource=pilot-source\ntag=` + regexp.QuoteMeta(tag) + `\nproxy_run=4242\n` +
+			want := regexp.MustCompile(`^mode=pilot-only\nsource=pilot-source\ntag=` + regexp.QuoteMeta(tag) +
+				`\nbeside=1\.31\.1-drj\.4-distroless\nproxy_run=4242\n` +
 				`proxy_run_head=referenced-head\nPROXY_REPO_SHA=native-proxy-source\n` +
 				`native-proxy-amd64=100 sha256:[0-9a-f]{64}\nnative-proxy-arm64=101 sha256:[0-9a-f]{64}\n$`)
 			if !want.Match(inputs) {

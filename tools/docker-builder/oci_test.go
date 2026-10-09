@@ -230,23 +230,32 @@ func TestOCIWorkflowTag(t *testing.T) {
 		t.Fatal("no native tag input handling")
 	}
 	version := job.Env["VERSION"]
-	for _, suffix := range []string{"-drj.1-distroless", "-drj.123-distroless", "-distroless", "-drj.0-distroless", "-drj.1-debug", "-drj.1-distroless; touch injected"} {
-		t.Run(suffix, func(t *testing.T) {
-			dest := filepath.Join(t.TempDir(), "env")
-			cmd := exec.Command("bash", "-c", script)
-			cmd.Env = append(os.Environ(), "VERSION="+version, "INPUT_ARTIFACT_TAG="+version+suffix, "GITHUB_ENV="+dest)
-			out, err := cmd.CombinedOutput()
-			valid := suffix == "-drj.1-distroless" || suffix == "-drj.123-distroless"
-			if valid {
-				got, readErr := os.ReadFile(dest)
-				if err != nil || readErr != nil || string(got) != "TAG="+version+strings.TrimSuffix(suffix, "-distroless")+"\n" {
-					t.Fatalf("tag input lost: %s %v %v %s", got, err, readErr, out)
+	// A full build takes drj.N; a pilot-only build (proxy run set) drj.N-pilot.M.
+	full := map[string]bool{"-drj.1-distroless": true, "-drj.123-distroless": true}
+	pilot := map[string]bool{"-drj.4-pilot.1-distroless": true, "-drj.4-pilot.12-distroless": true}
+	for _, suffix := range []string{
+		"-drj.1-distroless", "-drj.123-distroless", "-distroless", "-drj.0-distroless", "-drj.1-debug",
+		"-drj.1-distroless; touch injected", "-drj.4-pilot.1-distroless", "-drj.4-pilot.12-distroless",
+		"-drj.4-pilot.0-distroless", "-drj.4-pilot-distroless", "-drj.4-pilot.1-debug", "-drj.0-pilot.1-distroless",
+	} {
+		for _, run := range []string{"", "4242"} {
+			t.Run(suffix+"/run="+run, func(t *testing.T) {
+				dest := filepath.Join(t.TempDir(), "env")
+				cmd := exec.Command("bash", "-c", script)
+				cmd.Env = append(os.Environ(), "VERSION="+version, "INPUT_ARTIFACT_TAG="+version+suffix, "GITHUB_ENV="+dest, "PROXY_RUN_ID="+run)
+				out, err := cmd.CombinedOutput()
+				valid := (run == "" && full[suffix]) || (run != "" && pilot[suffix])
+				if valid {
+					got, readErr := os.ReadFile(dest)
+					if err != nil || readErr != nil || string(got) != "TAG="+version+strings.TrimSuffix(suffix, "-distroless")+"\n" {
+						t.Fatalf("tag input lost: %s %v %v %s", got, err, readErr, out)
+					}
+				} else if err == nil {
+					t.Fatalf("invalid fork tag accepted: %s", out)
+				} else if _, err := os.Stat(dest); !os.IsNotExist(err) {
+					t.Fatal("invalid tag wrote workflow environment")
 				}
-			} else if err == nil {
-				t.Fatalf("invalid fork tag accepted: %s", out)
-			} else if _, err := os.Stat(dest); !os.IsNotExist(err) {
-				t.Fatal("invalid tag wrote workflow environment")
-			}
-		})
+			})
+		}
 	}
 }
