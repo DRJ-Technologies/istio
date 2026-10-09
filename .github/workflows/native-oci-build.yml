@@ -7,13 +7,19 @@ name: Native OCI build
         description: Immutable fork tag, including the distroless variant
         required: true
         default: 1.31.1-drj.1-distroless
+      proxy_run_id:
+        description: >-
+          Pilot only: a successful main run of this workflow whose native proxy
+          artifacts initialize the build. Empty builds every component.
+        required: false
+        default: ''
 
 permissions:
   contents: read
 
 jobs:
   proxy:
-    if: github.ref == 'refs/heads/main'
+    if: github.ref == 'refs/heads/main' && inputs.proxy_run_id == ''
     strategy:
       fail-fast: false
       matrix:
@@ -328,7 +334,13 @@ jobs:
 
   build:
     needs: proxy
-    if: github.ref == 'refs/heads/main'
+    # A pilot-only build skips the proxy job and reuses a referenced run's.
+    if: >-
+      !cancelled() && github.ref == 'refs/heads/main' &&
+      (needs.proxy.result == 'success' || (needs.proxy.result == 'skipped' && inputs.proxy_run_id != ''))
+    permissions:
+      contents: read
+      actions: read
     runs-on: ubuntu-24.04
     timeout-minutes: 180
     defaults:
@@ -353,12 +365,19 @@ jobs:
       - name: Select artifact tag
         env:
           INPUT_ARTIFACT_TAG: ${{ inputs.artifact_tag }}
+          PROXY_RUN_ID: ${{ inputs.proxy_run_id }}
         shell: bash
         run: |
           set -euo pipefail
           stem="${INPUT_ARTIFACT_TAG%-distroless}"
           release="${stem##*-drj.}"
-          if [[ "$INPUT_ARTIFACT_TAG" != "$VERSION-drj.$release-distroless" || ! "$release" =~ ^[1-9][0-9]*$ ]]; then
+          # A full build is drj.N; a pilot-only build is drj.N-pilot.M, beside
+          # the full drj.N proxy, CNI and ztunnel.
+          pattern='^[1-9][0-9]*$'
+          if [[ -n "$PROXY_RUN_ID" ]]; then
+            pattern='^[1-9][0-9]*-pilot\.[1-9][0-9]*$'
+          fi
+          if [[ "$INPUT_ARTIFACT_TAG" != "$VERSION-drj.$release-distroless" || ! "$release" =~ $pattern ]]; then
             echo 'Expected an immutable fork tag for the selected component version and distroless variant' >&2
             exit 1
           fi
@@ -383,13 +402,84 @@ jobs:
           go-version-file: istio/go.mod
           cache: false
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        if: inputs.proxy_run_id == ''
         with:
           name: native-proxy-amd64
           path: ${{ runner.temp }}/native-proxy-amd64
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        if: inputs.proxy_run_id == ''
         with:
           name: native-proxy-arm64
           path: ${{ runner.temp }}/native-proxy-arm64
+      - name: Download referenced native proxy artifacts
+        if: inputs.proxy_run_id != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PROXY_RUN_ID: ${{ inputs.proxy_run_id }}
+          INPUT_ARTIFACT_TAG: ${{ inputs.artifact_tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Never an upstream download: the referenced run must be this
+          # workflow's successful main build of the same native proxy source,
+          # and each artifact must match the digest GitHub recorded for it.
+          if [[ ! "$PROXY_RUN_ID" =~ ^[1-9][0-9]*$ ]]; then
+            echo 'proxy_run_id must be a workflow run ID' >&2
+            exit 1
+          fi
+          api() { gh api -H 'Accept: application/vnd.github+json' "repos/$GITHUB_REPOSITORY/$1"; }
+          proxy_sha() { python3 -c 'import json, sys; print(next(x["lastStableSHA"] for x in json.load(sys.stdin) if x["name"] == "PROXY_REPO_SHA"))'; }
+          run="$(api "actions/runs/$PROXY_RUN_ID")"
+          head="$(python3 -c '
+          import json, sys
+          r = json.load(sys.stdin)
+          ok = (r["path"] == ".github/workflows/native-oci-build.yml" and r["head_branch"] == "main"
+                and r["event"] == "workflow_dispatch" and r["status"] == "completed"
+                and r["conclusion"] == "success" and r["repository"]["full_name"] == sys.argv[1])
+          print(r["head_sha"] if ok else "")
+          ' "$GITHUB_REPOSITORY" <<< "$run")"
+          if [[ -z "$head" ]]; then
+            echo 'proxy_run_id is not a successful main run of this workflow' >&2
+            exit 1
+          fi
+          expected="$(proxy_sha < istio.deps)"
+          referenced="$(api "contents/istio.deps?ref=$head" |
+            python3 -c 'import base64, json, sys; sys.stdout.write(base64.b64decode(json.load(sys.stdin)["content"]).decode())' | proxy_sha)"
+          if [[ "$referenced" != "$expected" ]]; then
+            echo "Referenced run built PROXY_REPO_SHA $referenced, not $expected" >&2
+            exit 1
+          fi
+          artifacts="$(api "actions/runs/$PROXY_RUN_ID/artifacts?per_page=100")"
+          # The pilot tag names the full build it sits beside (drj.N-pilot.M
+          # beside drj.N); the referenced run must be that build.
+          beside="${INPUT_ARTIFACT_TAG%-pilot.*}-distroless"
+          python3 -c '
+          import json, sys
+          if not any(a["name"] == "istio-oci-" + sys.argv[1] for a in json.load(sys.stdin)["artifacts"]):
+              sys.exit("referenced run does not hold istio-oci-" + sys.argv[1])
+          ' "$beside" <<< "$artifacts"
+          printf 'mode=pilot-only\nsource=%s\ntag=%s\nbeside=%s\nproxy_run=%s\nproxy_run_head=%s\nPROXY_REPO_SHA=%s\n' \
+            "$GITHUB_SHA" "$INPUT_ARTIFACT_TAG" "$beside" "$PROXY_RUN_ID" "$head" "$expected" > "$RUNNER_TEMP/pilot-inputs.txt"
+          for arch in amd64 arm64; do
+            found="$(python3 -c '
+          import json, sys
+          name = "native-proxy-" + sys.argv[1]
+          found = [a for a in json.load(sys.stdin)["artifacts"] if a["name"] == name]
+          if len(found) != 1 or found[0]["expired"] or not str(found[0].get("digest") or "").startswith("sha256:"):
+              sys.exit("expected one unexpired " + name + " artifact with a recorded digest")
+          print(found[0]["id"], found[0]["digest"])
+          ' "$arch" <<< "$artifacts")"
+            read -r id digest <<< "$found"
+            zip="$RUNNER_TEMP/native-proxy-$arch.zip"
+            api "actions/artifacts/$id/zip" > "$zip"
+            if [[ "sha256:$(sha256sum "$zip" | cut -d' ' -f1)" != "$digest" ]]; then
+              echo "native-proxy-$arch does not match its recorded digest $digest" >&2
+              exit 1
+            fi
+            python3 -m zipfile -e "$zip" "$RUNNER_TEMP/native-proxy-$arch"
+            printf 'native-proxy-%s=%s %s\n' "$arch" "$id" "$digest" >> "$RUNNER_TEMP/pilot-inputs.txt"
+          done
+          cat "$RUNNER_TEMP/pilot-inputs.txt"
       - name: Prepare disposable hosted runner toolchain and storage
         shell: bash
         run: |
@@ -448,6 +538,7 @@ jobs:
       - name: Build native multiarch OCI layouts
         env:
           OCI_BUILDER: ${{ steps.builder.outputs.name }}
+          BUILD_TARGETS: ${{ inputs.proxy_run_id == '' && 'pilot,proxyv2,install-cni,ztunnel' || 'pilot' }}
         shell: bash
         run: |
           set -euo pipefail
@@ -473,13 +564,19 @@ jobs:
           # RunMake varies TARGET_ARCH per build; one explicit path cannot be
           # inherited by both architectures. Consume the real per-arch init outputs.
           unset DEBUG_IMAGE ISTIO_ENVOY_LINUX_RELEASE_PATH ISTIO_ENVOY_LINUX_DEBUG_PATH
-          ./tools/docker --targets pilot,proxyv2,install-cni,ztunnel --variants distroless \
+          ./tools/docker --targets "$BUILD_TARGETS" --variants distroless \
             --architectures linux/amd64,linux/arm64 \
             --oci-output-dir "$RUNNER_TEMP/istio-oci" --oci-builder "$OCI_BUILDER"
           check_build_sources
+      - name: Record pilot-only inputs
+        if: inputs.proxy_run_id != ''
+        shell: bash
+        run: |
+          set -euo pipefail
+          cp "$RUNNER_TEMP/pilot-inputs.txt" "$RUNNER_TEMP/istio-oci/pilot-inputs.txt"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
-          name: istio-oci-${{ inputs.artifact_tag }}
+          name: istio-oci-${{ inputs.proxy_run_id != '' && 'pilot-' || '' }}${{ inputs.artifact_tag }}
           path: ${{ runner.temp }}/istio-oci/
           if-no-files-found: error
           compression-level: 0

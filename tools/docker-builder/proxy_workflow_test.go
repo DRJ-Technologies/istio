@@ -147,6 +147,7 @@ func TestNativeProxyWorkflowTransport(t *testing.T) {
 		Permissions map[string]string
 		Jobs        map[string]struct {
 			If, Needs      string
+			Permissions    map[string]string
 			TimeoutMinutes int `json:"timeout-minutes"`
 			Strategy       struct {
 				Matrix struct {
@@ -177,10 +178,16 @@ func TestNativeProxyWorkflowTransport(t *testing.T) {
 	if workflow.Jobs["proxy"].TimeoutMinutes != 360 {
 		t.Fatal("native proxy job must retain the hosted six-hour maximum")
 	}
-	for _, job := range []string{"build", "proxy"} {
-		if workflow.Jobs[job].If != "github.ref == 'refs/heads/main'" {
-			t.Fatal("native build must use main")
-		}
+	if workflow.Jobs["proxy"].If != "github.ref == 'refs/heads/main' && inputs.proxy_run_id == ''" {
+		t.Fatal("native proxy must use main and run unless a pilot-only build references one")
+	}
+	if workflow.Jobs["build"].If != "!cancelled() && github.ref == 'refs/heads/main' && "+
+		"(needs.proxy.result == 'success' || (needs.proxy.result == 'skipped' && inputs.proxy_run_id != ''))" {
+		t.Fatal("components must use main and a successful proxy, or skip it only for a referenced pilot-only build")
+	}
+	if len(workflow.Jobs["build"].Permissions) != 2 || workflow.Jobs["build"].Permissions["contents"] != "read" ||
+		workflow.Jobs["build"].Permissions["actions"] != "read" {
+		t.Fatal("components may only read sources and referenced artifacts")
 	}
 	platforms := map[string]string{"amd64": "ubuntu-22.04/x86_64", "arm64": "ubuntu-24.04-arm/aarch64"}
 	for _, row := range workflow.Jobs["proxy"].Strategy.Matrix.Include {
@@ -232,16 +239,24 @@ func TestNativeProxyWorkflowTransport(t *testing.T) {
 		t.Fatal("cache and artifacts must fit after the native stop and shutdown grace")
 	}
 	downloads := map[string]bool{}
+	referenced := false
 	for _, step := range workflow.Jobs["build"].Steps {
 		if strings.HasPrefix(step.Uses, "actions/download-artifact@") {
 			name := step.With["name"]
-			if step.With["path"] != "${{ runner.temp }}/"+name || step.With["github-token"] != "" || step.With["run-id"] != "" {
+			if step.With["path"] != "${{ runner.temp }}/"+name || step.With["github-token"] != "" || step.With["run-id"] != "" ||
+				step.If != "inputs.proxy_run_id == ''" {
 				t.Fatal("download must select its own run's matching artifact without credentials")
 			}
 			downloads[name] = true
 		}
+		if step.Name == "Download referenced native proxy artifacts" {
+			if step.If != "inputs.proxy_run_id != ''" || len(downloads) != 2 {
+				t.Fatal("only a pilot-only build may fetch a referenced run's proxy outputs")
+			}
+			referenced = true
+		}
 	}
-	if len(downloads) != 2 || !downloads["native-proxy-amd64"] || !downloads["native-proxy-arm64"] {
+	if len(downloads) != 2 || !downloads["native-proxy-amd64"] || !downloads["native-proxy-arm64"] || !referenced {
 		t.Fatal("both proxy outputs must be transported separately")
 	}
 }

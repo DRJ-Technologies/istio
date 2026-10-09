@@ -40,6 +40,7 @@ func TestNativeOCISourceGuard(t *testing.T) {
 			Steps []struct {
 				Name, Uses, If, Run string
 				With                map[string]any
+				Env                 map[string]string
 			}
 		}
 	}
@@ -64,6 +65,10 @@ func TestNativeOCISourceGuard(t *testing.T) {
 			goVersionFile, _ = step.With["go-version-file"].(string)
 		case step.Name == "Build native multiarch OCI layouts":
 			script, buildStep = step.Run, i
+			// Every component, or pilot alone for a referenced pilot-only build.
+			if step.Env["BUILD_TARGETS"] != "${{ inputs.proxy_run_id == '' && 'pilot,proxyv2,install-cni,ztunnel' || 'pilot' }}" {
+				t.Fatal("component selection must follow the pilot-only input")
+			}
 		case strings.HasPrefix(step.Uses, "actions/upload-artifact@"):
 			upload = true
 			// A failed build must retain GitHub's default success condition.
@@ -99,7 +104,7 @@ func TestNativeOCISourceGuard(t *testing.T) {
 				"RUNNER_TEMP="+workspace, "OCI_BUILDER=synthetic-builder",
 				"DEBUG_IMAGE=external", "ISTIO_ENVOY_LINUX_RELEASE_PATH=/external/amd64",
 				"ISTIO_ENVOY_LINUX_DEBUG_PATH=/external/debug",
-				"FIXTURE_MODE="+mode, "FIXTURE_LOG="+marker)
+				"FIXTURE_MODE="+mode, "FIXTURE_LOG="+marker, "BUILD_TARGETS=pilot,proxyv2,install-cni,ztunnel")
 			write := func(path, data string, mode os.FileMode) {
 				t.Helper()
 				if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
@@ -138,6 +143,7 @@ set -euo pipefail
 test ! -v DEBUG_IMAGE
 test ! -v ISTIO_ENVOY_LINUX_RELEASE_PATH
 test ! -v ISTIO_ENVOY_LINUX_DEBUG_PATH
+test "$2" = "$BUILD_TARGETS"
 printf 'build\n' >> "$FIXTURE_LOG"
 case "$FIXTURE_MODE" in
   failed-build) exit 7 ;;
