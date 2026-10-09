@@ -1,0 +1,10 @@
+apiVersion: release-notes/v2
+kind: bug-fix
+area: traffic-management
+releaseNotes:
+  - |
+    **Fixed** ambient multicluster on a shared network routing traffic for a local Service to a remote
+    cluster when a remote global Service had been allocated the same ClusterIP. ClusterIPs are allocated
+    per cluster, so a remote cluster on the local network no longer contributes its Services' ClusterIPs.
+    Its endpoints still join same-name global Services, which callers reach through the local Service's
+    address. Remote clusters on other networks are unchanged.

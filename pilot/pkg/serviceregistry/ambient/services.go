@@ -194,18 +194,21 @@ func GlobalNestedWorkloadServicesCollection(
 			}
 			waypoints := *waypointsPtr
 			namespaces := cluster.Namespaces()
+			remoteNetwork := func(ctx krt.HandlerContext) network.ID {
+				return globalNetworks.FetchRemoteSystemNamespaceNetwork(ctx, namespaces)
+			}
+			build := serviceServiceBuilder(waypoints, namespaces, meshConfig, domainSuffix, false, checkServiceScope, remoteNetwork, false)
 			// N.B Never precompute the service info for remote clusters; the merge function will do that
-			servicesInfo := krt.NewCollection(services, serviceServiceBuilder(
-				waypoints,
-				namespaces,
-				meshConfig,
-				domainSuffix,
-				false,
-				checkServiceScope,
-				func(ctx krt.HandlerContext) network.ID {
-					return globalNetworks.FetchRemoteSystemNamespaceNetwork(ctx, namespaces)
-				}, false,
-			),
+			servicesInfo := krt.NewCollection(services, func(ctx krt.HandlerContext, s *v1.Service) *model.ServiceInfo {
+				si := build(ctx, s)
+				// Kubernetes allocates ClusterIPs per cluster. On the local network a remote
+				// cluster's ClusterIP can belong to an unrelated local Service, so keep the
+				// remote Service's endpoints and identity but not its addresses there.
+				if si != nil && len(si.Service.GetAddresses()) > 0 && remoteNetwork(ctx) == globalNetworks.FetchLocalNetworkID(ctx) {
+					si = withoutAddresses(si)
+				}
+				return si
+			},
 				append(
 					opts,
 					krt.WithName(fmt.Sprintf("ambient/ServiceServiceInfos[%s]", cluster.ID)),
@@ -748,6 +751,14 @@ func getVIPs(svc *v1.Service) []string {
 		}
 	}
 	return res
+}
+
+// withoutAddresses returns a copy of the service with no VIPs.
+func withoutAddresses(si *model.ServiceInfo) *model.ServiceInfo {
+	out := *si
+	out.Service = protomarshal.Clone(si.Service)
+	out.Service.Addresses = nil
+	return &out
 }
 
 func precomputeServicePtr(w *model.ServiceInfo) *model.ServiceInfo {
