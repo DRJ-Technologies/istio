@@ -29,10 +29,12 @@ import (
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/durationpb"
 
+	"istio.io/api/label"
 	networking "istio.io/api/networking/v1alpha3"
 	"istio.io/api/security/v1beta1"
 	"istio.io/istio/pilot/pkg/features"
 	"istio.io/istio/pilot/pkg/model"
+	istionetworking "istio.io/istio/pilot/pkg/networking"
 	"istio.io/istio/pilot/pkg/networking/core/listenertest"
 	"istio.io/istio/pilot/pkg/networking/telemetry"
 	"istio.io/istio/pilot/pkg/networking/util"
@@ -40,9 +42,11 @@ import (
 	xdsfilters "istio.io/istio/pilot/pkg/xds/filters"
 	"istio.io/istio/pilot/test/xdstest"
 	"istio.io/istio/pkg/config"
+	"istio.io/istio/pkg/config/constants"
 	"istio.io/istio/pkg/config/mesh"
 	"istio.io/istio/pkg/config/protocol"
 	"istio.io/istio/pkg/config/schema/gvk"
+	"istio.io/istio/pkg/test"
 	"istio.io/istio/pkg/wellknown"
 )
 
@@ -189,6 +193,77 @@ func TestInboundNetworkFilterIdleTimeout(t *testing.T) {
 			listenerFilters[len(listenerFilters)-1].GetTypedConfig().UnmarshalTo(tcp)
 			if !reflect.DeepEqual(tcp.IdleTimeout, tt.expected) {
 				t.Fatalf("Unexpected IdleTimeout, Expecting %s, Got %s", tt.expected, tcp.IdleTimeout)
+			}
+		})
+	}
+}
+
+func TestConnectForwarderIdleTimeout(t *testing.T) {
+	test.SetForTest(t, &features.EnableHBONESend, true)
+	test.SetForTest(t, &features.EnableAmbientMultiNetwork, true)
+	tcpProxyOf := func(t *testing.T, l *listener.Listener) *tcp.TcpProxy {
+		t.Helper()
+		filters := l.GetFilterChains()[0].GetFilters()
+		tp := &tcp.TcpProxy{}
+		if err := filters[len(filters)-1].GetTypedConfig().UnmarshalTo(tp); err != nil {
+			t.Fatal(err)
+		}
+		return tp
+	}
+	cases := []struct {
+		name        string
+		idleTimeout string
+		expected    *durationpb.Duration
+	}{
+		{"unset keeps the Envoy default", "", nil},
+		{"invalid keeps the Envoy default", "invalid-30s", nil},
+		{"zero disables", "0s", durationpb.New(0)},
+		{"explicit", "2h", durationpb.New(2 * time.Hour)},
+	}
+	for _, tt := range cases {
+		t.Run(tt.name, func(t *testing.T) {
+			cg := NewConfigGenTest(t, TestOptions{})
+			proxy := cg.SetupProxy(&model.Proxy{Metadata: &model.NodeMetadata{IdleTimeout: tt.idleTimeout}})
+			push := cg.PushContext()
+			for name, l := range map[string]*listener.Listener{
+				"connect_originate":     buildConnectOriginateListener(push, proxy, istionetworking.ListenerClassSidecarOutbound),
+				"forward_inner_connect": buildForwardInnerConnectListener(push, proxy, istionetworking.ListenerClassSidecarInbound),
+			} {
+				if got := tcpProxyOf(t, l).IdleTimeout; !proto.Equal(got, tt.expected) {
+					t.Fatalf("%s: IdleTimeout %v, want %v", name, got, tt.expected)
+				}
+			}
+			// Generated listeners: a gateway's connect_originate (appended after
+			// EnvoyFilter patches), a waypoint's, and an ambient east-west
+			// gateway's forward_inner_connect, which carries double HBONE.
+			metadata := &model.NodeMetadata{IdleTimeout: tt.idleTimeout}
+			for _, g := range []struct {
+				kind     string
+				proxy    *model.Proxy
+				listener string
+			}{
+				{"gateway", &model.Proxy{Type: model.Router, Metadata: metadata}, ConnectOriginate},
+				{"waypoint", &model.Proxy{
+					Type: model.Waypoint, Metadata: metadata,
+					Labels: map[string]string{label.GatewayManaged.Name: constants.ManagedGatewayMeshControllerLabel},
+				}, ConnectOriginate},
+				{"east-west gateway", &model.Proxy{
+					Type: model.Waypoint, Metadata: metadata,
+					Labels: map[string]string{label.GatewayManaged.Name: constants.ManagedGatewayEastWestControllerLabel},
+				}, ForwardInnerConnect},
+			} {
+				found := false
+				for _, l := range cg.ConfigGen.BuildListeners(cg.SetupProxy(g.proxy), push) {
+					if l.GetName() == g.listener {
+						found = true
+						if got := tcpProxyOf(t, l).IdleTimeout; !proto.Equal(got, tt.expected) {
+							t.Fatalf("%s %s: IdleTimeout %v, want %v", g.kind, g.listener, got, tt.expected)
+						}
+					}
+				}
+				if !found {
+					t.Fatalf("%s listeners lack %s", g.kind, g.listener)
+				}
 			}
 		})
 	}

@@ -814,6 +814,10 @@ func buildConnectForwarder(push *model.PushContext, proxy *model.Proxy, class is
 	tcpProxy := &tcp.TcpProxy{
 		StatPrefix:       clusterName,
 		ClusterSpecifier: &tcp.TcpProxy_Cluster{Cluster: clusterName},
+		// The proxy's IDLE_TIMEOUT, as its other TCP proxies use it. These internal
+		// listeners are built after EnvoyFilter patches apply, so this is the only
+		// way to lift Envoy's default 1h idle limit on long-lived HBONE streams.
+		IdleTimeout: parseDuration(proxy.Metadata.IdleTimeout),
 	}
 	if tunnel {
 		tcpProxy.TunnelingConfig = &tcp.TcpProxy_TunnelingConfig{
