@@ -15,7 +15,9 @@ package ambient
 
 import (
 	"fmt"
+	"net/netip"
 	"reflect"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -266,7 +268,11 @@ func TestAmbientMulticlusterIndex_WaypointForWorkloadTraffic(t *testing.T) {
 					},
 					map[string]string{},
 					[]int32{80}, map[string]string{"app": "a"}, ips["svc2"], client.sc)
-				s.assertEvent(t, s.svcXdsName("svc2"))
+				// A remote cluster on the local network contributes no ClusterIP, so its
+				// Service alone does not change the merged global Service.
+				if client.clusterID == s.clusterID || clusterToNetwork[client.clusterID] != clusterToNetwork[s.clusterID] {
+					s.assertEvent(t, s.svcXdsName("svc2"))
+				}
 			}
 
 			// Service configuration needs to be uniform, so we add services to all clusters first,
@@ -314,10 +320,10 @@ func TestAmbientMulticlusterIndex_WaypointForWorkloadTraffic(t *testing.T) {
 			for _, rc := range remoteClients.List() {
 				// Removing the service changes the WDS workload in that cluster due to service attachments.
 				// Note that we should NOT get an event changing the service attachment in our local cluster.
-				// We also get a service event because we lost an IP
+				// A remote cluster on the local network contributed no ClusterIP, so no IP is lost.
 				if clusterToNetwork[rc.clusterID] == clusterToNetwork[s.clusterID] {
 					s.deleteServiceForClient(t, "svc2", rc.sc)
-					s.assertEvent(t, s.podXdsNameForCluster("pod1", rc.clusterID), s.svcXdsName("svc2"))
+					s.assertEvent(t, s.podXdsNameForCluster("pod1", rc.clusterID))
 					s.deletePodForClient(t, "pod1", rc.pc)
 					s.assertEvent(t, s.podXdsNameForCluster("pod1", rc.clusterID))
 				} else {
@@ -1121,4 +1127,87 @@ func TestMulticlusterAmbientIndex_ClusterLifecycleNoLeak(t *testing.T) {
 		s.DeleteSecret("s2")
 		waitRemoteClusters(t, 1)
 	})
+}
+
+// Kubernetes allocates ClusterIPs per cluster, so on a shared network a remote
+// Service's ClusterIP can equal an unrelated local Service's. The local Service
+// keeps that address; the remote cluster's endpoints still merge into the
+// same-name global Service; on another network the remote addresses are kept.
+func TestMulticlusterAmbientIndex_SameNetworkClusterIPOwnership(t *testing.T) {
+	test.SetForTest(t, &features.EnableAmbientMultiNetwork, true)
+	s := newAmbientTestServer(t, testC, testNW, "")
+	s.AddSecret("s1", "remote-cluster")
+	remoteClients := krt.NewCollection(s.mcController.Clusters(), func(_ krt.HandlerContext, c *multicluster.Cluster) **remoteAmbientClients {
+		cl := c.Client
+		return ptr.Of(&remoteAmbientClients{
+			clusterID: c.ID,
+			ambientclients: &ambientclients{
+				pc: clienttest.NewDirectClient[*corev1.Pod, corev1.Pod, *corev1.PodList](t, cl),
+				sc: clienttest.NewDirectClient[*corev1.Service, corev1.Service, *corev1.ServiceList](t, cl),
+				ns: clienttest.NewWriter[*corev1.Namespace](t, cl),
+			},
+		})
+	})
+	assert.EventuallyEqual(t, func() int {
+		return len(remoteClients.List())
+	}, 1)
+	remote := remoteClients.List()[0]
+	remote.ns.Create(&corev1.Namespace{
+		ObjectMeta: metav1.ObjectMeta{Name: systemNS, Labels: map[string]string{label.TopologyNetwork.Name: testNW}},
+	})
+	remote.ns.Create(&corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: testNS}})
+
+	global := map[string]string{"istio.io/global": "true"}
+	// The same-name global Service in both clusters; only the remote one has endpoints.
+	s.addServiceForClient(t, "svc-global", global, map[string]string{}, []int32{80}, map[string]string{"app": "remote"}, "10.0.0.1", s.sc)
+	s.addServiceForClient(t, "svc-global", global, map[string]string{}, []int32{80}, map[string]string{"app": "remote"}, "10.0.0.2", remote.sc)
+	s.addPodsForClient(t, "127.0.0.2", "remote-pod", "sa1", map[string]string{"app": "remote"}, nil, true, corev1.PodRunning, remote.pc)
+	// An unrelated local Service holding the remote Service's ClusterIP.
+	s.addServiceForClient(t, "local-only", map[string]string{}, map[string]string{}, []int32{80}, map[string]string{"app": "local"}, "10.0.0.2", s.sc)
+
+	addresses := func(name string) []string {
+		svc := s.lookupService(s.svcXdsName(name))
+		if svc == nil {
+			return nil
+		}
+		var res []string
+		for _, a := range svc.Service.GetAddresses() {
+			ip, _ := netip.AddrFromSlice(a.Address)
+			res = append(res, a.Network+"/"+ip.String())
+		}
+		slices.Sort(res)
+		return res
+	}
+	servicesAt := func(addr string) []string {
+		var res []string
+		for _, ai := range s.Lookup(s.addrXdsName(addr)) {
+			if svc := ai.GetService(); svc != nil {
+				res = append(res, svc.Hostname)
+			}
+		}
+		return res
+	}
+	hasRemoteEndpoint := func() bool {
+		for _, ai := range s.Lookup(s.svcXdsName("svc-global")) {
+			if wl := ai.GetWorkload(); wl != nil && wl.Name == "remote-pod" {
+				return true
+			}
+		}
+		return false
+	}
+
+	// Same network: the global Service keeps only the local ClusterIP, the shared
+	// address resolves to the local Service alone, and remote endpoints still merge.
+	assert.EventuallyEqual(t, func() []string { return addresses("svc-global") }, []string{testNW + "/10.0.0.1"})
+	assert.EventuallyEqual(t, func() []string { return servicesAt("10.0.0.2") }, []string{s.hostnameForService("local-only")})
+	assert.EventuallyEqual(t, hasRemoteEndpoint, true)
+
+	// Another network: the remote ClusterIP is network-scoped there, so it is kept.
+	const remoteNetwork = "remote-network"
+	remote.ns.Update(&corev1.Namespace{
+		ObjectMeta: metav1.ObjectMeta{Name: systemNS, Labels: map[string]string{label.TopologyNetwork.Name: remoteNetwork}},
+	})
+	assert.EventuallyEqual(t, func() []string { return addresses("svc-global") },
+		[]string{remoteNetwork + "/10.0.0.2", testNW + "/10.0.0.1"})
+	assert.EventuallyEqual(t, func() []string { return servicesAt("10.0.0.2") }, []string{s.hostnameForService("local-only")})
 }
