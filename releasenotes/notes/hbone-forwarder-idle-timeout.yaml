@@ -1,0 +1,9 @@
+apiVersion: release-notes/v2
+kind: bug-fix
+area: traffic-management
+releaseNotes:
+  - |
+    **Fixed** the internal HBONE forwarders (`connect_originate`, and `forward_inner_connect` on ambient
+    east-west gateways) ignoring the proxy's `ISTIO_META_IDLE_TIMEOUT`. Their TCP proxy now uses it, as the
+    proxy's other TCP proxies do, so long-lived tunneled connections can outlast Envoy's default 1h idle
+    timeout (`0s` disables it). Without the setting, behavior is unchanged.
